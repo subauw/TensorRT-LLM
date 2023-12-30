@@ -287,9 +287,27 @@ inline int getMultiProcessorCount()
     return multi_processor_count;
 }
 
-inline int divUp(int a, int n)
+inline int getMaxSharedMemoryPerBlockOptin()
 {
-    return (a + n - 1) / n;
+    int device_id;
+    int max_shared_memory_per_block;
+    check_cuda_error(cudaGetDevice(&device_id));
+    check_cuda_error(
+        cudaDeviceGetAttribute(&max_shared_memory_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id));
+    return max_shared_memory_per_block;
+}
+
+template <typename T1, typename T2>
+inline size_t divUp(const T1& a, const T2& n)
+{
+    size_t tmp_a = static_cast<size_t>(a);
+    size_t tmp_n = static_cast<size_t>(n);
+    return (tmp_a + tmp_n - 1) / tmp_n;
+}
+
+inline int roundUp(int a, int n)
+{
+    return divUp(a, n) * n;
 }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
@@ -388,6 +406,17 @@ template <typename T>
 void print2dToScreen(const T* result, const int r, const int c, const int stride)
 {
     print2dToStream(result, r, c, stride, stdout);
+}
+
+template <typename T>
+void print2dToFile(std::string fname, const T* result, const int r, const int c, const int stride)
+{
+    FILE* fp = fopen(fname.c_str(), "wt");
+    if (fp != nullptr)
+    {
+        print2dToStream(result, r, c, stride, fp);
+        fclose(fp);
+    }
 }
 
 inline void print_float_(float x)

@@ -37,14 +37,28 @@ function(add_gtest test_name test_src)
 
   if(NOT WIN32) # Linux
     target_link_libraries(
-      ${test_name} PUBLIC ${SHARED_TARGET} gtest_main gmock_main nvonnxparser
-                          nvinfer_plugin_tensorrt_llm)
+      ${test_name}
+      PUBLIC ${SHARED_TARGET}
+             ${TORCH_LIBRARIES}
+             ${Python3_LIBRARIES}
+             gtest_main
+             gmock_main
+             nvonnxparser
+             th_common
+             nvinfer_plugin_tensorrt_llm)
   else()
     # Use STATIC_TARGET on Windows because MSVC is picky about duplicate symbols
     # if the shared and static libs both get linked
     target_link_libraries(
-      ${test_name} PUBLIC ${STATIC_TARGET} gtest_main gmock_main nvonnxparser
-                          nvinfer_plugin_tensorrt_llm)
+      ${test_name}
+      PUBLIC ${STATIC_TARGET}
+             ${TORCH_LIBRARIES}
+             ${Python3_LIBRARIES}
+             gtest_main
+             gmock_main
+             nvonnxparser
+             th_common
+             nvinfer_plugin_tensorrt_llm)
   endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
@@ -64,6 +78,7 @@ add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
 add_gtest(allocatorTest common/allocatorTest.cpp)
 add_gtest(memoryUtilsTest common/memoryUtilsTest.cu)
+add_gtest(mpiUtilsTest common/mpiUtilsTest.cpp)
 add_gtest(quantizationTest common/quantizationTest.cpp)
 add_gtest(stringUtilsTest common/stringUtilsTest.cpp)
 add_gtest(tllmExceptionTest common/tllmExceptionTest.cpp)
@@ -74,8 +89,27 @@ add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
 add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
-add_gtest(torchTest runtime/torchTest.cpp)
-target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+add_gtest(iTensorTest runtime/iTensorTest.cpp)
+add_gtest(worldConfigTest runtime/worldConfigTest.cpp)
+add_gtest(mixtureOfExpertsTest kernels/mixtureOfExpertsTest.cu)
+if(${BUILD_PYT})
+  add_gtest(torchTest runtime/torchTest.cpp)
+  target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+endif()
+set(SAMPLING_KERNEL_TEST_SRC
+    kernels/sampling/samplingTest.cpp
+    kernels/sampling/samplingTopKTest.cpp
+    kernels/sampling/samplingTopPTest.cpp
+    kernels/sampling/samplingPenaltyTest.cpp
+    kernels/sampling/samplingUtilsTest.cu)
+add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
+add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
+add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
+set(SAMPLING_LAYER_TEST_SRC
+    layers/samplingLayerTest.cpp layers/topKSamplingLayerTest.cpp
+    layers/topPSamplingLayerTest.cpp)
+add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)

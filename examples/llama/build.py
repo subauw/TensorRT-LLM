@@ -14,32 +14,40 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import LlamaConfig, LlamaForCausalLM
-from weight import (get_scaling_factors, load_from_awq_llama, load_from_binary,
-                    load_from_gptq_llama, load_from_hf_llama,
-                    load_from_meta_llama)
 
+try:
+    from transformers import MixtralForCausalLM
+except ImportError:
+    MixtralForCausalLM = None
 import tensorrt_llm
+from tensorrt_llm import profiler
 from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
+from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.layers.attention import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import (fp8_quantize, smooth_quantize,
-                                 weight_only_groupwise_quantize,
-                                 weight_only_quantize)
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime.lora_manager import LoraConfig
 
-from weight import parse_ft_config  # isort:skip
+from tensorrt_llm.models.llama.weight import (  # isort:skip
+    get_scaling_factors, load_from_awq_llama, load_from_binary,
+    load_from_gptq_llama, load_from_hf_checkpoint, load_from_hf_llama,
+    load_from_meta_llama, parse_bin_config)
 
 MODEL_NAME = "llama"
 
@@ -117,7 +125,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -129,7 +137,7 @@ def parse_arguments():
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--model_dir', type=str, default=None)
-    parser.add_argument('--ft_model_dir', type=str, default=None)
+    parser.add_argument('--bin_model_dir', type=str, default=None)
     parser.add_argument('--meta_ckpt_dir', type=str, default=None)
     parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--dtype',
@@ -179,6 +187,7 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16', 'float32', 'bfloat16'])
+
     parser.add_argument('--parallel_build', default=False, action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
@@ -186,7 +195,18 @@ def parse_arguments():
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--visualize', default=False, action='store_true')
+    parser.add_argument('--load_by_shard',
+                        action='store_true',
+                        help='Load a pretrained model shard-by-shard.')
     parser.add_argument('--enable_debug_output',
                         default=False,
                         action='store_true')
@@ -195,13 +215,22 @@ def parse_arguments():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='llama_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
     parser.add_argument('--remove_input_padding',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--use_fused_mlp',
+        default=False,
+        action='store_true',
+        help=
+        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
+        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors are discarded '
+        '(0.45734 vs 0.45755 for LLaMA-v2 7B using ammo/examples/hf/instruct_eval/mmlu.py).'
+    )
 
     # Arguments related to the quantization of the model.
     parser.add_argument(
@@ -288,6 +317,14 @@ def parse_arguments():
         help='Quantize weights for the various GEMMs to INT4/INT8.'
         'See --weight_only_precision to set the precision')
     parser.add_argument(
+        '--disable_weight_only_quant_plugin',
+        default=False,
+        action="store_true",
+        help=
+        'By default, using plugin implementation for weight quantization. Enabling disable_weight_only_quant_plugin flag will use ootb implementation instead of plugin.'
+        'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
         '--weight_only_precision',
         const='int8',
         type=str,
@@ -312,7 +349,7 @@ def parse_arguments():
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -331,9 +368,51 @@ def parse_arguments():
         action='store_true',
         help=
         'Activates latency-optimized algorithm for all-reduce instead of NCCL.')
+    parser.add_argument(
+        '--max_prompt_embedding_table_size',
+        type=int,
+        default=0,
+        help='Setting to a value > 0 enables support for prompt tuning.')
+    parser.add_argument('--gather_all_token_logits',
+                        action='store_true',
+                        default=False)
+    parser.add_argument(
+        '--use_lora_plugin',
+        nargs='?',
+        const=None,
+        default=False,
+        choices=['float16', 'float32', 'bfloat16'],
+        help="Activates the lora plugin which enables embedding sharing.")
+    parser.add_argument('--hf_lora_dir', type=str, default=None)
+    parser.add_argument(
+        '--moe_num_experts',
+        default=0,
+        type=int,
+        help='Specify the number of experts to use for MOE layers')
+    parser.add_argument(
+        '--moe_top_k',
+        default=0,
+        type=int,
+        help=
+        'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
+    )
+    parser.add_argument(
+        '--moe_tp_mode',
+        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
+        type=int,
+        help=
+        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
+    )
+    parser.add_argument(
+        '--moe_renorm_mode',
+        default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+        type=int,
+        help=
+        'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
+    )
 
     args = parser.parse_args()
-    tensorrt_llm.logger.set_level(args.log_level)
+    logger.set_level(args.log_level)
 
     assert not (
         args.use_smooth_quant and args.use_weight_only
@@ -363,17 +442,13 @@ def parse_arguments():
         args.quant_mode = QuantMode.use_smooth_quant(args.per_token,
                                                      args.per_channel)
     elif args.use_weight_only:
-        if args.per_group:
-            args.quant_mode = QuantMode.from_description(
-                quantize_weights=True,
-                quantize_activations=False,
-                per_token=False,
-                per_channel=False,
-                per_group=True,
-                use_int4_weights=True)
-        else:
-            args.quant_mode = QuantMode.use_weight_only(
-                args.weight_only_precision == 'int4')
+        args.quant_mode = QuantMode.from_description(
+            quantize_weights=True,
+            quantize_activations=False,
+            per_token=False,
+            per_channel=False,
+            per_group=args.per_group,
+            use_int4_weights="int4" in args.weight_only_precision)
     else:
         args.quant_mode = QuantMode(0)
 
@@ -385,6 +460,7 @@ def parse_arguments():
         args.quant_mode = args.quant_mode.set_fp8_qdq()
 
     if args.rotary_scaling is not None:
+        assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
         rotary_scaling = {
             "type": args.rotary_scaling[0],
             "factor": float(args.rotary_scaling[1])
@@ -392,12 +468,7 @@ def parse_arguments():
         assert rotary_scaling["type"] in ["linear", "dynamic"]
         assert rotary_scaling["factor"] > 1.0
         args.rotary_scaling = rotary_scaling
-        if rotary_scaling["type"] == "dynamic":
-            assert not args.remove_input_padding, "TODO: Not supported yet"
 
-    # Since gpt_attenttion_plugin is the only way to apply RoPE now,
-    # force use the plugin for now with the correct data type.
-    args.use_gpt_attention_plugin = args.dtype
     if args.model_dir is not None:
         hf_config = LlamaConfig.from_pretrained(args.model_dir)
         args.inter_size = hf_config.intermediate_size  # override the inter_size for LLaMA
@@ -407,9 +478,21 @@ def parse_arguments():
             args.n_kv_head = hf_config.num_key_value_heads
         args.n_layer = hf_config.num_hidden_layers
         args.n_positions = hf_config.max_position_embeddings
-        args.vocab_size = hf_config.vocab_size
+        args.vocab_size = hf_config.vocab_size if hf_config.vocab_size is not None else args.vocab_size
         args.hidden_act = hf_config.hidden_act
         args.rms_norm_eps = hf_config.rms_norm_eps
+        # These attributes only exists with Mixtral, for the moment
+        args.moe_num_experts = getattr(hf_config, "num_local_experts",
+                                       args.moe_num_experts)
+        args.moe_top_k = getattr(hf_config, "num_experts_per_tok",
+                                 args.moe_top_k)
+        args.rotary_base = getattr(hf_config, "rope_theta", args.rotary_base)
+        args.model_type = hf_config.model_type
+        if hf_config.model_type == "mixtral":
+            # HF LLaMA-type models are implicitly using gated activation.
+            # With our MoE implementation, we must make it explicit
+            args.hidden_act = "swiglu"
+
     elif args.meta_ckpt_dir is not None:
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:
             meta_config: dict = json.load(fp)
@@ -417,27 +500,32 @@ def parse_arguments():
         args.n_head = meta_config["n_heads"]
         args.n_layer = meta_config["n_layers"]
         args.n_kv_head = meta_config.get("n_kv_heads", args.n_head)
-        args.multiple_of = meta_config["multiple_of"]
-        args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
-        n_embd = int(4 * args.n_embd * 2 / 3)
-        args.inter_size = args.multiple_of * (
-            (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
-            args.multiple_of)
+        if "hidden_dim" in meta_config:
+            args.inter_size = meta_config["hidden_dim"]
+        else:
+            args.multiple_of = meta_config.get("multiple_of", 1)
+            n_embd = int(4 * args.n_embd * 2 / 3)
+            args.ffn_dim_multiplier = meta_config.get("ffn_dim_multiplier", 1)
+            args.inter_size = args.multiple_of * (
+                (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
+                // args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
-    elif args.ft_model_dir is not None:
-        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_ft_config(
-            Path(args.ft_model_dir) / "config.ini")
+        args.moe_num_experts = meta_config.get("moe", {}).get("num_experts", 0)
+        args.moe_top_k = meta_config.get("moe", {}).get("num_experts_per_tok",
+                                                        0)
+    elif args.bin_model_dir is not None:
+        n_embd, n_head, n_layer, n_positions, vocab_size, hidden_act, inter_size, n_kv_head = parse_bin_config(
+            Path(args.bin_model_dir) / "config.ini")
         args.inter_size = inter_size  # override the inter_size for LLaMA
         args.n_kv_head = n_kv_head
         args.n_embd = n_embd
         args.n_head = n_head
         args.n_layer = n_layer
         args.n_positions = n_positions
-        args.vocab_size = vocab_size
+        args.vocab_size = vocab_size if args.vocab_size is None else args.vocab_size
         args.hidden_act = hidden_act
         args.rms_norm_eps = 1e-06
         logger.warning("Set rms_norm_eps to 1e-06 directly.")
-    assert args.use_gpt_attention_plugin, "LLaMa must use gpt attention plugin"
     if args.n_kv_head is None:
         args.n_kv_head = args.n_head
     elif args.n_kv_head != args.n_head:
@@ -447,13 +535,39 @@ def parse_arguments():
             "MQA/GQA requires either the number of K/V heads to be divisible by the tensor parallelism size OR " \
             "the tensor parallelism size to be divisible by the number of K/V heads."
 
-    if args.dtype == 'bfloat16':
-        assert args.use_gemm_plugin, "Please use gemm plugin when dtype is bfloat16"
+    hf_modules_to_trtllm_modules = {
+        "q_proj": "attn_q",
+        "v_proj": "attn_k",
+        "k_proj": "attn_v",
+        "o_proj": "attn_dense",
+        "gate_proj": "mlp_h_to_4h",
+        "down_proj": "mlp_4h_to_h",
+        "up_proj": "mlp_gate"
+    }  # lora modules on llama
+
+    lora_config = LoraConfig.from_hf(args.hf_lora_dir,
+                                     hf_modules_to_trtllm_modules)
+
+    if lora_config.is_valid and lora_config.vocab_size != 0:
+        args.vocab_size = lora_config.vocab_size
+
+    args.lora_config = lora_config
+
+    if args.weight_only_precision == 'int4_awq':
+        if args.vocab_size % 64 != 0:
+            args.vocab_size = int((args.vocab_size + 63) / 64) * 64
+            logger.info("To use awq we pad it to {}.".format(args.vocab_size))
 
     assert args.pp_size * args.tp_size == args.world_size
 
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
+
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     if args.inter_size is None:
         # this should not be need when loading a real model
@@ -463,6 +577,12 @@ def parse_arguments():
             (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1) //
             args.multiple_of)
         logger.info(f"Setting inter_size to {args.inter_size}.")
+
+    if args.moe_num_experts and args.moe_top_k == 0:
+        args.moe_top_k = 1
+    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
+                                args.moe_tp_mode,
+                                args.moe_renorm_mode).validate()
 
     return args
 
@@ -485,6 +605,7 @@ def build_rank_engine(builder: Builder,
     assert args.n_layer % args.pp_size == 0, \
         f"num_layers {args.n_layer} must be a multiple of pipeline parallelism size {args.pp_size}"
 
+    profiler.print_memory_usage(f'Rank {rank} Engine build starts')
     # Initialize Module
     tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
         num_layers=args.n_layer,
@@ -503,74 +624,92 @@ def build_rank_engine(builder: Builder,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim,
         quant_mode=args.quant_mode,
-        rms_norm_eps=args.rms_norm_eps)
-    if args.use_smooth_quant:
-        tensorrt_llm_llama = smooth_quantize(tensorrt_llm_llama,
-                                             args.quant_mode)
-    elif args.use_weight_only:
-        if args.weight_only_precision == 'int8':
-            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
-                                                      args.quant_mode)
-        elif args.weight_only_precision == 'int4':
-            tensorrt_llm_llama = weight_only_quantize(tensorrt_llm_llama,
-                                                      args.quant_mode)
-        elif args.weight_only_precision == 'int4_awq':
-            tensorrt_llm_llama = weight_only_groupwise_quantize(
-                model=tensorrt_llm_llama,
-                quant_mode=args.quant_mode,
-                group_size=args.group_size,
-                zero=False,
-                pre_quant_scale=True,
-                exclude_modules=[])
+        rms_norm_eps=args.rms_norm_eps,
+        use_fused_mlp=args.use_fused_mlp,
+        use_prompt_tuning=args.max_prompt_embedding_table_size > 0,
+        moe_config=args.moe_config)
+    quantize_kwargs = {}
+    if args.use_smooth_quant or args.use_weight_only:
+        if args.weight_only_precision == 'int4_awq':
+            quantize_kwargs = {
+                "group_size": args.group_size,
+                "zero": False,
+                "pre_quant_scale": True,
+                "exclude_modules": [],
+            }
         elif args.weight_only_precision == 'int4_gptq':
-            tensorrt_llm_llama = weight_only_groupwise_quantize(
-                model=tensorrt_llm_llama,
-                quant_mode=args.quant_mode,
-                group_size=args.group_size,
-                zero=True,
-                pre_quant_scale=False)
+            quantize_kwargs = {
+                "group_size": args.group_size,
+                "zero": True,
+                "pre_quant_scale": False,
+            }
     elif args.enable_fp8 or args.fp8_kv_cache:
         logger.info(f'Loading scaling factors from '
                     f'{args.quantized_fp8_model_path}')
         quant_scales = get_scaling_factors(args.quantized_fp8_model_path,
                                            num_layers=args.n_layer,
                                            quant_mode=args.quant_mode)
-        tensorrt_llm_llama = fp8_quantize(tensorrt_llm_llama,
-                                          quant_mode=args.quant_mode,
-                                          quant_scales=quant_scales)
+        quantize_kwargs = {"quant_scales": quant_scales}
+
+    if args.use_weight_only and args.moe_config.has_moe():
+        if 'exclude_modules' in quantize_kwargs:
+            quantize_kwargs['exclude_modules'].append('router')
+        else:
+            quantize_kwargs['exclude_modules'] = ['lm_head', 'router']
+
+    tensorrt_llm_llama = quantize_model(tensorrt_llm_llama, args.quant_mode,
+                                        **quantize_kwargs)
     if args.per_group:
         load_func = load_from_awq_llama if args.weight_only_precision == 'int4_awq' else load_from_gptq_llama
         load_func(tensorrt_llm_llama=tensorrt_llm_llama,
                   quant_ckpt_path=args.quant_ckpt_path,
                   mapping=mapping,
-                  dtype=args.dtype)
+                  dtype=args.dtype,
+                  bin_model_dir=args.bin_model_dir)
     elif args.meta_ckpt_dir is not None:
         load_from_meta_llama(tensorrt_llm_llama, args.meta_ckpt_dir, mapping,
                              args.dtype)
     elif args.model_dir is not None:
         logger.info(f'Loading HF LLaMA ... from {args.model_dir}')
         tik = time.time()
-        hf_llama = LlamaForCausalLM.from_pretrained(
-            args.model_dir,
-            device_map={
-                "model": "cpu",
-                "lm_head": "cpu"
-            },  # Load to CPU memory
-            torch_dtype="auto")
+        if not args.load_by_shard:
+            hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
+            hf_llama = hf_model.from_pretrained(
+                args.model_dir,
+                device_map={
+                    "model": "cpu",
+                    "lm_head": "cpu",
+                    "embed_tokens": "cpu",
+                    "layers": "cpu",
+                    "norm": "cpu",
+                },  # Load to CPU memory
+                torch_dtype='auto',
+            )
+            use_gemm_woq_plugin = not args.disable_weight_only_quant_plugin
+            load_from_hf_llama(tensorrt_llm_llama,
+                               hf_llama,
+                               mapping=mapping,
+                               dtype=args.dtype,
+                               use_gemm_woq_plugin=use_gemm_woq_plugin,
+                               lora_config=args.lora_config)
+            del hf_llama
+        else:
+            load_from_hf_checkpoint(tensorrt_llm_llama,
+                                    args.model_dir,
+                                    mapping,
+                                    dtype=args.dtype,
+                                    lora_config=args.lora_config)
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'HF LLaMA loaded. Total time: {t}')
-        load_from_hf_llama(tensorrt_llm_llama,
-                           hf_llama,
-                           mapping=mapping,
-                           dtype=args.dtype)
-        del hf_llama
-    elif args.ft_model_dir is not None:
+
+    elif args.bin_model_dir is not None:
         load_from_binary(tensorrt_llm_llama,
-                         args.ft_model_dir,
+                         args.bin_model_dir,
                          mapping,
                          fp16=(args.dtype == 'float16'),
                          multi_query_mode=(args.n_kv_head != args.n_head))
+    profiler.print_memory_usage(f'Rank {rank} model weight loaded.')
 
     # Module -> Network
     network = builder.create_network()
@@ -579,9 +718,15 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        if not args.enable_fp8:
+            network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        else:
+            logger.info(
+                "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_rmsnorm_plugin:
         network.plugin_config.set_rmsnorm_plugin(dtype=args.use_rmsnorm_plugin)
+    if args.use_lora_plugin:
+        network.plugin_config.set_lora_plugin(dtype=args.use_lora_plugin)
 
     # Quantization plugins.
     if args.use_smooth_quant:
@@ -595,7 +740,10 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
-    if args.use_weight_only:
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
+
+    if args.use_weight_only and not args.disable_weight_only_quant_plugin:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
                 dtype='float16')
@@ -615,11 +763,16 @@ def build_rank_engine(builder: Builder,
         network.set_named_parameters(tensorrt_llm_llama.named_parameters())
 
         # Forward
-        inputs = tensorrt_llm_llama.prepare_inputs(args.max_batch_size,
-                                                   args.max_input_len,
-                                                   args.max_output_len, True,
-                                                   args.max_beam_width,
-                                                   args.max_num_tokens)
+        inputs = tensorrt_llm_llama.prepare_inputs(
+            args.max_batch_size,
+            args.max_input_len,
+            args.max_output_len,
+            True,
+            args.max_beam_width,
+            args.max_num_tokens,
+            prompt_embedding_table_size=args.max_prompt_embedding_table_size,
+            gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules)
         tensorrt_llm_llama(*inputs)
         if args.enable_debug_output:
             # mark intermediate nodes' outputs
@@ -641,6 +794,7 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
     return engine
 
 
@@ -652,14 +806,15 @@ def build(rank, args):
 
     # when doing serializing build, all ranks share one engine
     builder = Builder()
-
     cache = None
     for cur_rank in range(args.world_size):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        tik = time.time()
+
         # NOTE: when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
-        int8_trt_flag = args.quant_mode.has_act_and_weight_quant() or (
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
             not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
@@ -676,19 +831,44 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
             int8=int8_trt_flag,
-            fp8=args.quant_mode.has_fp8_qdq(),
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed,
-            opt_level=args.builder_opt)
+            opt_level=args.builder_opt,
+            max_prompt_embedding_table_size=args.
+            max_prompt_embedding_table_size,
+            gather_all_token_logits=args.gather_all_token_logits,
+            lora_target_modules=args.lora_config.lora_target_modules,
+        )
         engine_name = get_engine_name(MODEL_NAME, args.dtype, args.tp_size,
                                       args.pp_size, cur_rank)
         engine = build_rank_engine(builder, builder_config, engine_name,
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
+
+        local_num_kv_heads = (args.n_kv_head + args.world_size -
+                              1) // args.world_size
+        kv_dtype = str_dtype_to_trt(args.dtype)
+        if args.quant_mode.has_int8_kv_cache():
+            kv_dtype = str_dtype_to_trt('int8')
+        elif args.quant_mode.has_fp8_kv_cache():
+            kv_dtype = str_dtype_to_trt('fp8')
+        profiler.check_gpt_mem_usage(
+            engine=engine,
+            kv_dtype=kv_dtype,
+            use_gpt_attention_plugin=args.use_gpt_attention_plugin,
+            paged_kv_cache=args.paged_kv_cache,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            local_num_kv_heads=local_num_kv_heads,
+            head_size=args.n_embd / args.n_head,
+            num_layers=args.n_layer)
 
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.
@@ -696,6 +876,13 @@ def build(rank, args):
                 cache = builder_config.trt_builder_config.get_timing_cache()
 
         serialize_engine(engine, os.path.join(args.output_dir, engine_name))
+        del engine
+        profiler.print_memory_usage(f'Rank {cur_rank} Engine serialized')
+
+        tok = time.time()
+        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+        logger.info(
+            f'Rank {cur_rank} Engine build time: {t} - {tok - tik} (sec)')
 
     if rank == 0:
         ok = builder.save_timing_cache(

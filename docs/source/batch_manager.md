@@ -19,7 +19,7 @@ A software component (called the client in the text that follows) can interact
 with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
 in the [`callbacks.h`](source:cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.
 
-These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions descibed below.
+These callbacks are invoked in the generation loop at regular intervals and serve a variety of functions described below.
 
 ### Get and Send Callbacks
 
@@ -87,12 +87,56 @@ callback:
 using ReturnBatchManagerStatsCallback = std::function<void(const std::string&)>;
 ```
 
-The statistics are packaged as a JSON string. That string contains three fields:
+The statistics are packaged as a JSON string. That string contains the following fields:
   * `Timestamp`, the timestamp of the request (obtained using
     `std::put_time(&tm, "%m-%d-%Y %H:%M:%S")`),
-  * `Iteration Counter`, a counter value that corresponds to the execution of a
-    given request,
-  * `Active Request Count`, the number of active requests.
+  * `Iteration Counter`, a global step counter value that increases monotonically over time
+  * `Active Request Count`, the number of active requests in batch manager
+  * `Max Request Count`, the max number of requests batch manager can support at a time
+
+When using paged KV cache, following statistics are reported:
+  * `Max KV cache blocks`, the maximum number of KV cache blocks per GPU
+  * `Free KV cache blocks`, number of free KV cache blocks per GPU
+  * `Used KV cache blocks`, number of used KV cache blocks per GPU
+  * `Tokens per KV cache block`, number of tokens per KV cache block
+  * `Scheduled Requests`, number of requests scheduled this iteration
+
+When using in-flight batching, the following additional statistics are reported per step/iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
+  * `Context Requests`, number of requests in Context phase
+  * `Generation Requests`, number of requests in Generation phase
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `MicroBatch ID`, micro batch ID
+
+When using V1 batching, the following additional statistics are reported per V1 iteration:
+
+  * `Scheduled Requests`, number of total requests scheduled
+  * `Context Requests`, number of requests in Context phase
+  * `Total Generation Tokens`, Total number of tokens generated
+  * `Total Context Tokens`, total number of tokens across requests in context phase
+  * `Empty Generation Slots`, total number of padded Slots during generation phase
+
+### Other mandatory GptManager parameters
+* `trtEnginePath`, path to the directory containing the TRT-LLM engine that GptManager wraps
+* `modelType`, batching scheme - V1, InflightBatching or InflightFusedBatching.
+  - `V1` refers to the traditional batching scheme with a batch of requests running in lockstep until the full generation for all of them is complete. Requests in a batch are all padded up to the maximum input and output sequence length of any member of the batch.
+  - `InflightBatching` refers to a scheme where newly arrived requests are dynamically incorporated into the batch under execution, and requests are returned as soon as the end condition is met without any padding.
+  - `InflightFusedBatching` is an improvement on `InflightBatching`, leveraging additional operation fusion opportunities and is expected to be strictly superior to it.
+* `maxBeamWidth`, the maximum beam width GptManager will allow for any request.
+* `schedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
+  - `MAX_UTILIZATION` packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.
+  - `GUARANTEED_NO_EVICT` uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.
+
+### Optional GptManager parameters
+* `TrtGptModelOptionalParams` class encapsulates the following fields:
+  - `kvCacheConfig`
+    - `maxTokens` (default: unspecified) refers to the maximum number of tokens reserved for KV cache across all requests. If specified, the final allocated KV cache considers this parameter as well as `freeGpuMemoryFraction` below.
+    - `maxAttentionWindow` (default: unspecified) refers to the maximum number of tokens attended to in the model when using features like sliding window attention or StreamingLLM. If unspecified, each generated tokens attends to all previous tokens like traditional MHA or MQA.
+    - `freeGpuMemoryFraction` (default: 0.85) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If `maxTokens` is specified, allocated KV cache is the minimum of `maxTokens` and the value inferred from `freeGpuMemoryFraction`.
+    - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
+  - `maxNumSequences` (default: unspecified) maximum number of sequences that can be in progress in any iteration. It is recommended that this value be left unspecified and the value will be inferred from the TRT-LLM engine.
+  - `enableTrtOverlap` (default: `true`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime.
 
 ### GptManager Design
 
@@ -121,12 +165,13 @@ auto-regressive model like GPT can be created as follows:
 using namespace tensorrt_llm::batch_manager;
 
 GptManager batchManager(pathToTrtEngine,                   // Path to the TensorRT engine of the model,
-                        TrtGptModelType::InflightBatching, // Use in-flight batching,
+                        TrtGptModelType::InflightFusedBatching, // Use in-flight batching,
                         maxBeamWidth,                      // Maximum beam width (must be >= 1),
                         schedulerPolicy,                   // Scheduling policy (see below),
-                        maxNumRequests,                    // Maximum number of requests,
                         getInferenceRequestsCb,            // The Get callback (see above),
-                        sendResponseCb);                   // The Send callback (see above).
+                        sendResponseCb,                    // The Send callback (see above),
+                        pollStopSignalCb,                  // The Stop signals callback (see above),
+                        returnBatchManagerStatsCb);        // The Return stats callback (see above),
 ```
 
 The scheduler policy helps the batch manager adjust how requests are scheduled

@@ -17,75 +17,83 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
-#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
-#include <cstdlib>
-#include <mpi.h>
+#include <algorithm>
+#include <numeric>
+#include <set>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-namespace
+WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelism, SizeType rank, SizeType gpusPerNode,
+    std::optional<std::vector<SizeType>> const& deviceIds)
+    : mTensorParallelism{tensorParallelism}
+    , mPipelineParallelism{pipelineParallelism}
+    , mRank{rank}
+    , mGpusPerNode{gpusPerNode}
+    , mDeviceIds{deviceIds.value_or(std::vector<SizeType>(mGpusPerNode))}
 {
+    auto const numDevices = mDeviceIds.size();
+    TLLM_CHECK(numDevices > 0);
 
-bool mpiInitialized = false;
-
-void initMpi(nvinfer1::ILogger& logger, int threadMode = MPI_THREAD_FUNNELED)
-{
-    if (mpiInitialized)
+    if (!deviceIds.has_value())
     {
-        return;
+        mDeviceIds.resize(mGpusPerNode);
+        std::iota(mDeviceIds.begin(), mDeviceIds.end(), 0);
+    }
+    else
+    {
+        // total number is at most mGpusPerNode
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) <= mGpusPerNode,
+            "Number of device IDs %zu is greater than GPUs per node %d", numDevices, mGpusPerNode);
+
+        // all deviceIds is within the range
+        TLLM_CHECK(*std::max_element(mDeviceIds.begin(), mDeviceIds.end()) < mGpusPerNode);
+        TLLM_CHECK(*std::min_element(mDeviceIds.begin(), mDeviceIds.end()) >= 0);
+
+        // all ids are unique
+        std::set<SizeType> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
+        TLLM_CHECK_WITH_INFO(
+            deviceIdSet.size() == numDevices, "Device IDs are not unique %zu != %zu", deviceIdSet.size(), numDevices);
+
+        // log a warning if device ids are not contiguous
+        if (std::adjacent_find(deviceIdSet.begin(), deviceIdSet.end(), [](auto x, auto y) { return y - x != 1; })
+            != deviceIdSet.end())
+        {
+            TLLM_LOG_WARNING("The user specified device IDs are not contiguous!");
+        }
+        TLLM_LOG_INFO("Using user-specified devices: %s", tc::arr2str(mDeviceIds.data(), numDevices).c_str());
     }
 
-    int initialized = 0;
-    TLLM_MPI_CHECK(MPI_Initialized(&initialized), logger);
-    if (!initialized)
-    {
-        logger.log(
-            nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("Initializing MPI with thread mode %d", threadMode).c_str());
-        int providedMode;
-        TLLM_MPI_CHECK(MPI_Init_thread(nullptr, nullptr, threadMode, &providedMode), logger);
-        TLLM_CHECK_WITH_INFO(providedMode >= threadMode, "MPI_Init_thread failed");
-        std::atexit([]() { MPI_Finalize(); });
-    }
+    TLLM_CHECK(mTensorParallelism > 0);
+    TLLM_CHECK(mPipelineParallelism > 0);
 
-    mpiInitialized = true;
+    TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) >= tensorParallelism * pipelineParallelism,
+        "Number of GPUs per node %d must be at least as large as TP (%d) * PP (%d)", mGpusPerNode, mTensorParallelism,
+        mPipelineParallelism);
 }
 
-} // namespace
-
-bool WorldConfig::validConfig(nvinfer1::ILogger& logger, SizeType tensorParallelism, SizeType pipelineParallelism)
+bool WorldConfig::validConfig(SizeType tensorParallelism, SizeType pipelineParallelism)
 {
-    initMpi(logger);
-
-    int mpiSize;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize), logger);
+    auto const mpiSize = COMM_SESSION.getSize();
     return mpiSize == tensorParallelism * pipelineParallelism;
 }
 
-WorldConfig WorldConfig::mpi(nvinfer1::ILogger& logger, SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism)
+WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
+    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
 {
-    initMpi(logger);
-
-    int mpiSize, mpiRank;
-    TLLM_MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &mpiSize), logger);
-    TLLM_MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &mpiRank), logger);
-    logger.log(nvinfer1::ILogger::Severity::kINFO, tc::fmtstr("MPI size: %d, rank: %d", mpiSize, mpiRank).c_str());
-
+    auto& comm = COMM_SESSION;
+    auto const mpiSize = comm.getSize();
+    auto const mpiRank = comm.getRank();
+    TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
     auto pp = pipelineParallelism.value_or(1);
     auto tp = tensorParallelism.value_or(mpiSize / pp);
     TLLM_CHECK(mpiSize == tp * pp);
-    return WorldConfig{tp, pp, mpiRank, gpusPerNode};
-}
 
-WorldConfig WorldConfig::mpi(
-    SizeType gpusPerNode, std::optional<SizeType> tensorParallelism, std::optional<SizeType> pipelineParallelism)
-{
-    TllmLogger logger{};
-    return mpi(logger, gpusPerNode, tensorParallelism, pipelineParallelism);
+    return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
 }
 
 std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const

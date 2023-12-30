@@ -13,12 +13,16 @@ Welcome to TensorRT-LLM's documentation!
    architecture.md
    gpt_runtime.md
    batch_manager.md
+   inference_request.md
    gpt_attention.md
    precision.md
+   installation.md
    performance.md
    2023-05-19-how-to-debug.md
    2023-05-17-how-to-add-a-new-model.md
    graph-rewriting.md
+   memory.md
+   new_workflow.md
 
 Python API
 ----------
@@ -27,7 +31,7 @@ Python API
 - :doc:`tensorrt_llm.functional <python-api/tensorrt_llm.functional>`
 - :doc:`tensorrt_llm.models <python-api/tensorrt_llm.models>`
 - :doc:`tensorrt_llm.plugin <python-api/tensorrt_llm.plugin>`
-- :doc:`tensorrt_llm.qunatization <python-api/tensorrt_llm.quantization>`
+- :doc:`tensorrt_llm.quantization <python-api/tensorrt_llm.quantization>`
 - :doc:`tensorrt_llm.runtime <python-api/tensorrt_llm.runtime>`
 
 
@@ -64,3 +68,15 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
+
+
+Blogs
+----------
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Blogs
+   :hidden:
+
+   blogs/H100vsA100.md
+   blogs/H200launch.md

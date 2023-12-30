@@ -41,7 +41,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, world_size, *args):
         '--builder_opt=0',
         f'--world_size={world_size}',
     ] + list(args)
-    print("Runnning: " + " ".join(args))
+    print("Running: " + " ".join(args))
     _egb.run_build(args)
 
 
@@ -98,7 +98,10 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
         run_command(["git", "lfs", "pull", "--include", model_file_name],
                     cwd=hf_dir)
 
-    (hf_dir / "model.safetensors").unlink(missing_ok=True)
+    safetensor_file = hf_dir / "model.safetensors"
+    has_safetensor = safetensor_file.exists()
+    if has_safetensor:
+        safetensor_file.rename(str(safetensor_file) + ".bak")
 
     assert (hf_dir / model_file_name).is_file()
 
@@ -143,11 +146,31 @@ def build_engines(model_cache: _tp.Optional[str] = None, world_size: int = 1):
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
                  '--remove_input_padding')
     # this engine can be use for in-flight batching
+    ifb_args = [
+        '--dtype=float16', '--use_gpt_attention_plugin=float16',
+        '--remove_input_padding', '--paged_kv_cache',
+        '--enable_context_fmha_fp32_acc', '--max_num_tokens=10000',
+        '--use_paged_context_fmha'
+    ]
     build_engine(fp16_weight_dir_x_gpu,
                  engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir, tp_size,
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding', '--paged_kv_cache',
-                 '--enable_context_fmha', '--max_num_tokens=10000')
+                 '--max_draft_len=5', *ifb_args)
+
+    # We build almost the same engine twice. But this engine has gather_all_token_logits
+    # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
+    # which uses context FMHA for draft tokens prediction.
+    # Currently the gather_all_token_logits is not supported with target model of speculative decoding
+    build_engine(fp16_weight_dir_x_gpu,
+                 engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir,
+                 tp_size, '--gather_all_token_logits',
+                 '--use_context_fmha_for_generation', *ifb_args)
+    build_engine(
+        fp16_weight_dir_x_gpu, engine_dir /
+        'fp16-plugin-packed-paged-context-fmha-for-gen' / tp_pp_dir, tp_size,
+        '--use_context_fmha_for_generation', '--max_draft_len=5', *ifb_args)
+
+    if has_safetensor:
+        _pl.Path(str(safetensor_file) + ".bak").rename(safetensor_file)
 
     print("Done.")
 

@@ -176,7 +176,7 @@ public:
     // requires shared ownership to read from other
     using writer_lock = std::shared_lock<std::shared_timed_mutex>;
 
-    // Struct of contining map if GEMMs to the best profiles for different Ms
+    // Struct of continuing map if GEMMs to the best profiles for different Ms
     struct MNKProfileMap
     {
         // Mutex guarding map
@@ -248,6 +248,8 @@ protected:
     }
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
+
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
 
 private:
     void allocateTmpData();

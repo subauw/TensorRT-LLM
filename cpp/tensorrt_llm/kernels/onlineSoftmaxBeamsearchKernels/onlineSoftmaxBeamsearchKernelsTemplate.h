@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/onlineSoftmaxBeamsearchKernels.h"
 
 using namespace tensorrt_llm::common;
@@ -113,11 +114,14 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void batch_topK_kernel(const int*
 template <typename T, int MAX_K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__
     void batch_topk_kernel(const int* __restrict x, const T* __restrict y, int** output_ids_ptr, float* __restrict v,
-        float* output_log_probs, const bool* finished, const int* sequence_lengths, BeamHypotheses beam_hyps,
-        const int V, const int K, const int vocab_size, const float length_penalty, const T diversity_rate)
+        float* output_log_probs, const FinishedState* finished, const int* sequence_lengths, BeamHypotheses beam_hyps,
+        const int V, const int K, const int vocab_size, const float* length_penalties, const float* diversity_rates)
 {
     int thread_id = threadIdx.x;
     int vector_id = blockIdx.x;
+    const int global_batch_idx{beam_hyps.ite * beam_hyps.local_batch_size + vector_id};
+    const T diversity_rate{diversity_rates[global_batch_idx]};
+    const float length_penalty{length_penalties[global_batch_idx]};
 
     // reposition x, y to data for the current vector
     x += vector_id * V;
@@ -140,7 +144,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     __syncthreads();
     if (beam_hyps.num_beams != nullptr)
     {
-        const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + vector_id;
         if (beam_hyps.num_beams[global_batch_idx] == 0 && thread_id == 0)
         {
             beam_hyps.min_normed_scores[global_batch_idx] = FLT_MAX;
@@ -161,11 +164,12 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     for (int elem_id = thread_id; elem_id < V; elem_id += THREADBLOCK_SIZE)
     {
         int i = beam_hyps.num_beams == nullptr ? elem_id % K : elem_id / 2 / K;
-        T elem = length_penalty == 0.0f ? y[elem_id]
-                                        : apply_length_penalty(y[elem_id],
-                                            finished[vector_id * K + i] ? sequence_lengths[vector_id * K + i]
-                                                                        : sequence_lengths[vector_id * K + i] + 1,
-                                            length_penalty);
+        T elem = length_penalty == 0.0f
+            ? y[elem_id]
+            : apply_length_penalty(y[elem_id],
+                finished[vector_id * K + i].isFinished() ? sequence_lengths[vector_id * K + i]
+                                                         : sequence_lengths[vector_id * K + i] + 1,
+                length_penalty);
         elem += diversity_rate * (T) i;
         int elem_idx = elem_id; // x[elem_id];
         partial.insert(elem, elem_idx);
@@ -179,18 +183,12 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 
         for (int i = 0; i < MAX_K; ++i)
         {
-            if (beam_hyps.num_beams != nullptr && x[total.p[i]] % vocab_size == beam_hyps.end_ids[vector_id])
+            if (i < K && beam_hyps.num_beams != nullptr && x[total.p[i]] % vocab_size == beam_hyps.end_ids[vector_id])
             {
                 // if beam_token does not belong to top num_beams tokens, it should not
                 // be added. Refer from
                 // https://github.com/huggingface/transformers/blob/v4.24.0/src/transformers/generation_beam_search.py#L257
-                if (i >= K)
                 {
-                    // do nothing
-                }
-                else
-                {
-                    const int global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + vector_id;
                     const float normed_score = (float) total.u[i];
                     const int num_beam = beam_hyps.num_beams[global_batch_idx];
                     int beam_idx = num_beam;
@@ -334,7 +332,7 @@ __device__ __forceinline__ TopKMD<T, MAX_K> reduce_topk_md_op(const TopKMD<T, MA
 
 template <typename T, int ITEMS_PER_THREAD, int MAX_K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_kernel(const T* __restrict x,
-    const T* __restrict b, const float* __restrict c, const bool* __restrict finished, int* __restrict z,
+    const T* __restrict b, const float* __restrict c, const FinishedState* __restrict finished, int* __restrict z,
     T* __restrict v, int V, int K, const int* __restrict end_ids)
 {
     int thread_id = threadIdx.x;
@@ -350,7 +348,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
     __shared__ typename BlockReduce::TempStorage temp_storage;
 
     TopKMD<float, MAX_K> partial;
-    bool finish = finished[vector_id];
+    bool finish = finished[vector_id].isFinished();
     for (int i = 0; i < MAX_K; ++i)
     {
         partial.topk.p[i] = -1;
@@ -407,7 +405,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beam_online_softmax_topk_ker
 template <typename T, int ITEMS_PER_THREAD, int MAX_K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
     void beam_online_softmax_topk_stage1_kernel(const T* __restrict x, const T* __restrict b,
-        const bool* __restrict finished, float* __restrict t, int V, int K, const int* __restrict end_ids)
+        const FinishedState* __restrict finished, float* __restrict t, int V, int K, const int* __restrict end_ids)
 {
     int thread_id = threadIdx.x;
     int vector_id = blockIdx.x; // batch beam index.
@@ -438,7 +436,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
 #else
     TopKMD<T, MAX_K> partial;
 #endif
-    bool finish = finished[vector_id];
+    bool finish = finished[vector_id].isFinished();
     for (int i = 0; i < MAX_K; ++i)
     {
         partial.topk.p[i] = -1;
@@ -596,10 +594,11 @@ void beam_online_softmax_topk_stage2_kernelLauncher(const float* temp_storage, c
 }
 
 template <typename T, int MAX_K>
-void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* finished, const int* sequence_lengths,
-    float* cum_log_probs, float* output_log_probs, int** output_ids_ptr, void* temp_storage,
-    const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size, const int beam_width,
-    const int vocab_size, const int* end_ids, T diversity_rate, const float length_penalty, cudaStream_t stream)
+void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const FinishedState* finished,
+    const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr,
+    void* temp_storage, const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size,
+    const int beam_width, const int vocab_size, const int* end_ids, const float* diversity_rates,
+    const float* length_penalties, cudaStream_t stream)
 {
     const int items_per_thread = 1;
     const int block_sz = (MAX_K < 16) ? (MAX_K < 8) ? SMALL_TOP_K_SOFTMAX_THREADBLOCK_SIZE : 128 : 64;
@@ -608,7 +607,7 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* 
     assert(temp_storage_size % 2 == 0);
     assert(temp_storage_size >= 2 * batch_size * beam_width * beam_width * 2);
     // Beam search needs the sequence lengths of beams to apply length penalty.
-    assert(length_penalty == 0.0f || sequence_lengths != nullptr);
+    assert(length_penalties == nullptr || sequence_lengths != nullptr);
 
     const int topk_buf_offset = ceil(batch_size * beam_width * beam_width * 2 / 4.) * 4;
     int* topk_tmp_id_buf = reinterpret_cast<int*>(temp_storage);
@@ -645,16 +644,16 @@ void topK_softMax_kernelLauncher(const T* log_probs, const T* bias, const bool* 
     // we will not put them into next iteration
     batch_topk_kernel<T, MAX_K * 2, 32><<<batch_size, 32, 0, stream>>>(topk_tmp_id_buf, topk_tmp_val_buf,
         output_ids_ptr, cum_log_probs, output_log_probs, finished, sequence_lengths, *beam_hyps,
-        beam_width * beam_width * 2, beam_width, vocab_size, length_penalty, diversity_rate);
+        beam_width * beam_width * 2, beam_width, vocab_size, length_penalties, diversity_rates);
     sync_check_cuda_error();
 }
 
 #define INSTANTIATE_BEAMSEARCH_K(T, MAX_K)                                                                             \
-    template void topK_softMax_kernelLauncher<T, MAX_K>(const T* log_probs, const T* bias, const bool* finished,       \
-        const int* sequence_lengths, float* cum_log_probs, float* output_log_probs, int** output_ids_ptr,              \
-        void* temp_storage, const int temp_storage_size, BeamHypotheses* beam_hyps, const int batch_size,              \
-        const int beam_width, const int vocab_size, const int* end_ids, T diversity_rate, const float length_penalty,  \
-        cudaStream_t stream);
+    template void topK_softMax_kernelLauncher<T, MAX_K>(const T* log_probs, const T* bias,                             \
+        const FinishedState* finished, const int* sequence_lengths, float* cum_log_probs, float* output_log_probs,     \
+        int** output_ids_ptr, void* temp_storage, const int temp_storage_size, BeamHypotheses* beam_hyps,              \
+        const int batch_size, const int beam_width, const int vocab_size, const int* end_ids,                          \
+        const float* diversity_rates, const float* length_penalties, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -14,23 +14,29 @@
 # limitations under the License.
 import argparse
 import json
+import math
 import os
 import time
+from pathlib import Path
 
-import tensorrt as trt
+# isort: off
 import torch
 import torch.multiprocessing as mp
+import tensorrt as trt
+# isort: on
 from transformers import AutoModelForCausalLM
-from weight import get_scaling_factors, load_from_awq_gpt_j, load_from_hf_gpt_j
+from weight import (get_scaling_factors, load_from_awq_gpt_j,
+                    load_from_bin_gpt_j, load_from_hf_gpt_j, parse_config)
 
 import tensorrt_llm
+from tensorrt_llm._utils import str_dtype_to_trt
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import (weight_only_groupwise_quantize,
-                                 weight_only_quantize)
+from tensorrt_llm.models import quantize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.profiler import check_gpt_mem_usage
 from tensorrt_llm.quantization import QuantMode
 
 MODEL_NAME = "gptj"
@@ -46,7 +52,7 @@ def serialize_engine(engine, path):
     logger.info(f'Serializing engine to {path}...')
     tik = time.time()
     with open(path, 'wb') as f:
-        f.write(bytearray(engine))
+        f.write(engine)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Engine serialized. Total time: {t}')
@@ -63,6 +69,13 @@ def parse_arguments(args):
         type=str,
         default=None,
         help='The path to HF GPT-J model / checkpoints to read weights from')
+    parser.add_argument(
+        '--ft_model_dir',
+        type=str,
+        default=None,
+        help=
+        'The path to FT-format (binary) GPT-J model / checkpoints to read weights from'
+    )
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -102,12 +115,6 @@ def parse_arguments(args):
                         type=str,
                         default=False,
                         choices=['float16', 'float32'])
-    parser.add_argument('--use_weight_only_quant_matmul_plugin',
-                        nargs='?',
-                        const='float16',
-                        type=str,
-                        default=False,
-                        choices=['float16'])
     parser.add_argument('--use_layernorm_plugin',
                         nargs='?',
                         const='float16',
@@ -121,11 +128,19 @@ def parse_arguments(args):
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--multi_block_mode',
+        default=False,
+        action='store_true',
+        help=
+        'Split long kv sequence into multiple blocks (applied to generation MHA kernels). \
+                        It is beneifical when batchxnum_heads cannot fully utilize GPU.'
+    )
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='gpt_outputs',
+        default='engine_outputs',
         help=
         'The path to save the serialized engine files, timing cache file and model configs'
     )
@@ -146,17 +161,17 @@ def parse_arguments(args):
         'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
     parser.add_argument(
+        '--int8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
+    )
+    parser.add_argument(
         '--use_inflight_batching',
         action="store_true",
         default=False,
         help="Activates inflight batching mode of gptAttentionPlugin.")
-    parser.add_argument(
-        '--enable_two_optimization_profiles',
-        default=False,
-        action='store_true',
-        help=
-        "Enables two optimization profiles during engine build, for context and generate phases. By default (and for inflight batching too), only 1 opt profile."
-    )
     parser.add_argument(
         '--paged_kv_cache',
         action="store_true",
@@ -166,7 +181,7 @@ def parse_arguments(args):
     )
     parser.add_argument('--tokens_per_block',
                         type=int,
-                        default=64,
+                        default=128,
                         help='Number of tokens per block in paged KV cache')
     parser.add_argument(
         '--max_num_tokens',
@@ -180,7 +195,7 @@ def parse_arguments(args):
         help=
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
-        'The falg is built for GPTQ/AWQ quantization.')
+        'The flag is built for GPTQ/AWQ quantization.')
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -243,21 +258,41 @@ def parse_arguments(args):
             args.n_layer = hf_gpt.config.n_layer
             args.n_positions = hf_gpt.config.n_positions
             args.vocab_size = hf_gpt.config.vocab_size
-
-    assert not (args.use_weight_only and args.weight_only_precision
-                == 'int8'), "Not support int8 weight only."
-
-    assert not (args.use_weight_only and args.weight_only_precision == 'int4'
-                and args.per_group
-                == False), "We only support AWQ for int4 weight only."
+    elif args.ft_model_dir is not None:
+        logger.info(f"Setting model configuration from {args.ft_model_dir}.")
+        n_embd, n_head, n_layer, n_positions, vocab_size, _, hidden_act, rotary_pct, bias, inter_size, multi_query_mode, dtype, prompt_num_tasks, prompt_max_vocab_size = parse_config(
+            Path(args.ft_model_dir) / "config.ini")
+        args.n_embd = n_embd
+        args.n_head = n_head
+        args.n_layer = n_layer
+        args.n_positions = n_positions
+        args.vocab_size = vocab_size
+        args.hidden_act = hidden_act
+        args.rotary_pct = rotary_pct
+        args.bias = bias
+        args.dtype = dtype
+        args.inter_size = inter_size
+        args.multi_query_mode = multi_query_mode
 
     if args.use_weight_only:
-        args.quant_mode = QuantMode.use_weight_only(
-            args.weight_only_precision == 'int4')
+        if args.per_group:
+            assert args.weight_only_precision == 'int4', "We only support per-group quantization (AWQ/GPT-Q) with INT4 precision"
+            args.quant_mode = QuantMode.from_description(
+                quantize_weights=True,
+                quantize_activations=False,
+                per_token=False,
+                per_channel=False,
+                per_group=True,
+                use_int4_weights=True)
+        else:
+            args.quant_mode = QuantMode.use_weight_only(
+                args.weight_only_precision == 'int4')
     else:
         args.quant_mode = QuantMode(0)
 
-    if args.fp8_kv_cache:
+    if args.int8_kv_cache:
+        args.quant_mode = args.quant_mode.set_int8_kv_cache()
+    elif args.fp8_kv_cache:
         assert (
             args.use_gpt_attention_plugin
         ), "You have to use GPT attention plugin when fp8 KV cache is set"
@@ -283,10 +318,11 @@ def parse_arguments(args):
     if args.max_num_tokens is not None:
         assert args.enable_context_fmha
 
-    if args.remove_input_padding or args.use_inflight_batching or args.paged_kv_cache:
-        assert (
-            not args.enable_two_optimization_profiles
-        ), "Only 1 opt profile supported for inflight batching and paged kv cache."
+    assert (math.log2(args.tokens_per_block).is_integer()
+            ), "tokens_per_block must be power of 2"
+    if args.enable_context_fmha or args.enable_context_fmha_fp32_acc:
+        assert (args.tokens_per_block >=
+                128), "Context fMHA requires >= 128 tokens per block"
 
     return args
 
@@ -301,6 +337,9 @@ def build_rank_engine(builder: Builder,
        @return: The built engine.
     '''
     kv_dtype = trt.float16 if args.dtype == 'float16' else trt.float32
+    mapping = Mapping(world_size=args.world_size,
+                      rank=rank,
+                      tp_size=args.world_size)  # TP only
 
     # Initialize Module
     tensorrt_llm_gpt = tensorrt_llm.models.GPTJForCausalLM(
@@ -313,28 +352,21 @@ def build_rank_engine(builder: Builder,
         rotary_dim=args.rotary_dim,
         dtype=kv_dtype,
         logits_dtype=args.logits_dtype,
-        mapping=Mapping(world_size=args.world_size,
-                        rank=rank,
-                        tp_size=args.world_size),  # TP only
+        mapping=mapping,
         quant_mode=args.quant_mode)
-    if args.use_weight_only_quant_matmul_plugin:
-        tensorrt_llm_gpt = weight_only_quantize(tensorrt_llm_gpt)
-    if args.use_weight_only and args.weight_only_precision == 'int4':
-        if args.per_group:
-            tensorrt_llm_gpt = weight_only_groupwise_quantize(
-                model=tensorrt_llm_gpt,
-                quant_mode=QuantMode.from_description(
-                    quantize_weights=True,
-                    quantize_activations=False,
-                    per_token=False,
-                    per_channel=False,
-                    per_group=True,
-                    use_int4_weights=True),
-                group_size=128,
-                zero=False,
-                pre_quant_scale=True,
-                exclude_modules=[],
-            )
+
+    quantize_kwargs = {}
+    if args.use_weight_only and args.per_group:
+        assert args.weight_only_precision == 'int4'
+        quantize_kwargs = {
+            "group_size": 128,
+            "zero": False,
+            "pre_quant_scale": True,
+            "exclude_modules": [],
+        }
+    tensorrt_llm_gpt = quantize_model(tensorrt_llm_gpt, args.quant_mode,
+                                      **quantize_kwargs)
+
     if args.model_dir is not None:
         assert hf_gpt is not None, f'Could not load weights from hf_gpt model as it is not loaded yet.'
         if args.enable_fp8:
@@ -345,13 +377,18 @@ def build_rank_engine(builder: Builder,
         if args.use_weight_only and args.weight_only_precision == 'int4' and args.per_group:
             load_from_awq_gpt_j(tensorrt_llm_gpt,
                                 awq_gpt_j=hf_gpt,
+                                ft_model_dir=args.ft_model_dir,
                                 config=awq_gptj_config,
+                                mapping=mapping,
                                 fp16=(args.dtype == 'float16'))
         else:
             load_from_hf_gpt_j(tensorrt_llm_gpt,
                                hf_gpt,
                                fp16=(args.dtype == 'float16'),
                                scaling_factors=gptj_scaling_factors)
+    elif args.ft_model_dir is not None:
+        load_from_bin_gpt_j(tensorrt_llm_gpt, args.ft_model_dir, rank,
+                            args.world_size, args.dtype)
 
     # Module -> Network
     network = builder.create_network()
@@ -360,7 +397,11 @@ def build_rank_engine(builder: Builder,
         network.plugin_config.set_gpt_attention_plugin(
             dtype=args.use_gpt_attention_plugin)
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        if not args.enable_fp8:
+            network.plugin_config.set_gemm_plugin(dtype=args.use_gemm_plugin)
+        else:
+            logger.info(
+                "Gemm plugin does not support FP8. Disabled Gemm plugin.")
     if args.use_layernorm_plugin:
         network.plugin_config.set_layernorm_plugin(
             dtype=args.use_layernorm_plugin)
@@ -370,12 +411,14 @@ def build_rank_engine(builder: Builder,
     if args.enable_context_fmha_fp32_acc:
         network.plugin_config.set_context_fmha(
             ContextFMHAType.enabled_with_fp32_acc)
-    if args.use_weight_only_quant_matmul_plugin:
-        network.plugin_config.set_weight_only_quant_matmul_plugin(
-            dtype=args.use_weight_only_quant_matmul_plugin)
+    if args.multi_block_mode:
+        network.plugin_config.enable_mmha_multi_block_mode()
     if args.use_weight_only:
         if args.per_group:
             network.plugin_config.set_weight_only_groupwise_quant_matmul_plugin(
+                dtype='float16')
+        else:
+            network.plugin_config.set_weight_only_quant_matmul_plugin(
                 dtype='float16')
     if args.world_size > 1:
         network.plugin_config.set_nccl_plugin(args.dtype)
@@ -395,9 +438,8 @@ def build_rank_engine(builder: Builder,
             args.max_output_len,
             True,
             args.max_beam_width,
-            max_num_tokens=args.max_num_tokens,
-            enable_two_optimization_profiles=args.
-            enable_two_optimization_profiles)
+            max_num_tokens=args.max_num_tokens)
+
         tensorrt_llm_gpt(*inputs)
 
     tensorrt_llm.graph_rewriting.optimize(network)
@@ -409,6 +451,7 @@ def build_rank_engine(builder: Builder,
     if rank == 0:
         config_path = os.path.join(args.output_dir, 'config.json')
         builder.save_config(builder_config, config_path)
+
     return engine
 
 
@@ -426,6 +469,9 @@ def build(rank, args):
         # skip other ranks if parallel_build is enabled
         if args.parallel_build and cur_rank != rank:
             continue
+        # NOTE(nkorobov): when only int8 kv cache is used together with paged kv cache no int8 tensors are exposed to TRT
+        int8_trt_flag = args.quant_mode.has_act_or_weight_quant() or (
+            not args.paged_kv_cache and args.quant_mode.has_int8_kv_cache())
 
         builder_config = builder.create_builder_config(
             name=MODEL_NAME,
@@ -440,10 +486,11 @@ def build(rank, args):
             hidden_act=args.hidden_act,
             max_position_embeddings=args.n_positions,
             max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
             max_input_len=args.max_input_len,
             max_output_len=args.max_output_len,
             max_num_tokens=args.max_num_tokens,
-            fp8=args.enable_fp8,
+            int8=int8_trt_flag,
             quant_mode=args.quant_mode,
             strongly_typed=args.strongly_typed)
 
@@ -452,6 +499,26 @@ def build(rank, args):
         engine = build_rank_engine(builder, builder_config, engine_name,
                                    cur_rank, args)
         assert engine is not None, f'Failed to build engine for rank {cur_rank}'
+
+        local_num_kv_heads = (args.n_head + args.world_size -
+                              1) // args.world_size
+        kv_dtype = str_dtype_to_trt(args.dtype)
+        if args.quant_mode.has_int8_kv_cache():
+            kv_dtype = str_dtype_to_trt('int8')
+        elif args.quant_mode.has_fp8_kv_cache():
+            kv_dtype = str_dtype_to_trt('fp8')
+        check_gpt_mem_usage(
+            engine=engine,
+            kv_dtype=kv_dtype,
+            use_gpt_attention_plugin=args.use_gpt_attention_plugin,
+            paged_kv_cache=args.paged_kv_cache,
+            max_batch_size=args.max_batch_size,
+            max_beam_width=args.max_beam_width,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            local_num_kv_heads=local_num_kv_heads,
+            head_size=args.n_embd / args.n_head,
+            num_layers=args.n_layer)
 
         if cur_rank == 0:
             # Use in-memory timing cache for multiple builder passes.

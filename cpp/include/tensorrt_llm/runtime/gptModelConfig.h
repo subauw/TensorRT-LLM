@@ -29,7 +29,7 @@ public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1, // https://github.com/THUDM/GLM
+        kGlm = 1, // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
     };
 
     constexpr explicit GptModelConfig(
@@ -46,12 +46,18 @@ public:
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
+        , mMaxBeamWidth(0)
         , mMaxInputLen(0)
         , mMaxOutputLen(0)
         , mMaxNumTokens(std::nullopt)
         , mComputeContextLogits(false)
+        , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
+        , mMaxPromptEmbeddingTableSize(0)
+        , mMaxDraftLen(0)
+        , mUseContextFMHAForGeneration(false)
+        , mPagedContextFMHA(false)
     {
     }
 
@@ -166,6 +172,16 @@ public:
         mMaxBatchSize = maxBatchSize;
     }
 
+    [[nodiscard]] SizeType constexpr getMaxBeamWidth() const noexcept
+    {
+        return mMaxBeamWidth;
+    }
+
+    void constexpr setMaxBeamWidth(SizeType maxBeamWidth) noexcept
+    {
+        mMaxBeamWidth = maxBeamWidth;
+    }
+
     [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
     {
         return mMaxInputLen;
@@ -196,6 +212,21 @@ public:
         mMaxNumTokens = maxNumTokens;
     }
 
+    [[nodiscard]] bool constexpr usePromptTuning() const noexcept
+    {
+        return mMaxPromptEmbeddingTableSize > 0;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxPromptEmbeddingTableSize() const noexcept
+    {
+        return mMaxPromptEmbeddingTableSize;
+    }
+
+    void constexpr setMaxPromptEmbeddingTableSize(SizeType maxPromptEmbeddingTableSize) noexcept
+    {
+        mMaxPromptEmbeddingTableSize = maxPromptEmbeddingTableSize;
+    }
+
     [[nodiscard]] bool constexpr computeContextLogits() const noexcept
     {
         return mComputeContextLogits;
@@ -204,6 +235,16 @@ public:
     void constexpr computeContextLogits(bool computeContextLogits) noexcept
     {
         mComputeContextLogits = computeContextLogits;
+    }
+
+    [[nodiscard]] bool constexpr computeGenerationLogits() const noexcept
+    {
+        return mComputeGenerationLogits;
+    }
+
+    void constexpr computeGenerationLogits(bool computeGenerationLogits) noexcept
+    {
+        mComputeGenerationLogits = computeGenerationLogits;
     }
 
     [[nodiscard]] ModelVariant getModelVariant() const
@@ -226,6 +267,41 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
+    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    {
+        mMaxDraftLen = maxDraftLen;
+    }
+
+    [[nodiscard]] SizeType getMaxDraftLen() const
+    {
+        return mMaxDraftLen;
+    }
+
+    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
+    {
+        return mMaxDraftLen + 1;
+    }
+
+    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
+    {
+        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
+    }
+
+    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
+    {
+        return mUseContextFMHAForGeneration;
+    }
+
+    void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
+    {
+        mPagedContextFMHA = pagedContextFMHA;
+    }
+
+    [[nodiscard]] bool constexpr getPagedContextFMHA() const noexcept
+    {
+        return mPagedContextFMHA;
+    }
+
 private:
     SizeType mVocabSize;
     SizeType mNbLayers;
@@ -239,13 +315,21 @@ private:
     SizeType mTokensPerBlock;
     common::QuantMode mQuantMode;
     SizeType mMaxBatchSize;
+    SizeType mMaxBeamWidth;
     SizeType mMaxInputLen;
     SizeType mMaxOutputLen;
     std::optional<SizeType> mMaxNumTokens;
 
     bool mComputeContextLogits;
+    bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
     bool mUseCustomAllReduce;
+
+    SizeType mMaxPromptEmbeddingTableSize;
+    SizeType mMaxDraftLen;
+
+    bool mUseContextFMHAForGeneration;
+    bool mPagedContextFMHA;
 };
 
 } // namespace tensorrt_llm::runtime

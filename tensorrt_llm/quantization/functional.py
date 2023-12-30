@@ -19,7 +19,8 @@ import tensorrt as trt
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
-from ..functional import Tensor, _create_tensor, cast, clip, constant, round
+from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
+                          constant, matmul, repeat_interleave, round)
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 
 
@@ -58,15 +59,28 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
             scales_b.trt_tensor
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+        _add_plugin_info(layer, plg_creator, "sq_gemm", pfc)
         layer.get_input(0).set_dynamic_range(-127, 127)
+        layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
-def weight_only_quant_matmul(input: Tensor, weights: Tensor, scales: Tensor,
-                             weightTypeId: int) -> Tensor:
+def weight_only_quant_matmul(input: Tensor,
+                             weights: Tensor,
+                             scales: Tensor,
+                             weightTypeId: int,
+                             dtype: str = 'float16') -> Tensor:
+
     if not default_net().plugin_config.weight_only_quant_matmul_plugin:
-        raise TypeError(
-            "Weight Only Qunat MatMul is only supported with plugin")
+        if weights.dtype != trt.int8:
+            # Q->DQ
+            weights = quantize(weights, scales, dtype='int8', axis=1)
+            weights = dequantize(weights, scales, 1, input.dtype)
+        else:
+            weights = dequantize(weights, scales, 1, input.dtype)
+
+        res = matmul(input, weights)
+        return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'WeightOnlyQuantMatmul', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -85,18 +99,40 @@ def weight_only_quant_matmul(input: Tensor, weights: Tensor, scales: Tensor,
         matmul_plug = plg_creator.create_plugin("woq_matmul", pfc)
         plug_inputs = [input.trt_tensor, weights.trt_tensor, scales.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        _add_plugin_info(layer, plg_creator, "woq_matmul", pfc)
+        layer.get_input(1).set_dynamic_range(-127, 127)
         return _create_tensor(layer.get_output(0), layer)
 
 
-def weight_only_groupwise_quant_matmul(input: Tensor, pre_quant_scale: Tensor,
-                                       weights: Tensor, scales: Tensor,
-                                       zeros: Tensor, biases: Tensor,
+def weight_only_groupwise_quant_matmul(input: Tensor,
+                                       pre_quant_scale: Tensor,
+                                       weights: Tensor,
+                                       scales: Tensor,
+                                       zeros: Tensor,
+                                       biases: Tensor,
                                        quant_algo: int,
-                                       group_size: int) -> Tensor:
+                                       group_size: int,
+                                       dtype: str = 'float16') -> Tensor:
+
     if not default_net(
     ).plugin_config.weight_only_groupwise_quant_matmul_plugin:
-        raise TypeError(
-            "Weight Only Groupwise Quant MatMul is only supported with plugin")
+        scales = repeat_interleave(scales, group_size, 0)
+        weights = quantize(weights, scales, dtype='int8', axis=1)
+        weights = dequantize(weights, scales, 1, input.dtype)
+
+        if quant_algo & 4:
+            # pre quant
+            input = input * pre_quant_scale
+        elif quant_algo & 2:
+            # zero
+            zeros = repeat_interleave(zeros, group_size, 0)
+            weights += zeros
+        res = matmul(input, weights)
+        if quant_algo & 1:
+            # bias
+            res += biases
+
+        return cast(res, dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'WeightOnlyGroupwiseQuantMatmul', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -140,6 +176,12 @@ def weight_only_groupwise_quant_matmul(input: Tensor, pre_quant_scale: Tensor,
             plug_inputs += [biases.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
+        _add_plugin_info(layer, plg_creator, "woq_groupwise_matmul", pfc)
+        if quant_algo & PRE_QUANT_SCALE:
+            layer.get_input(2).set_dynamic_range(-127, 127)
+        else:
+            layer.get_input(1).set_dynamic_range(-127, 127)
+
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -191,6 +233,7 @@ def smooth_quant_layer_norm(input: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, layernorm_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "layernorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
@@ -240,6 +283,7 @@ def smooth_quant_rms_norm(input: Tensor,
         ]
         layer = default_trtnet().add_plugin_v2(plug_inputs, rmsnorm_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "rmsnorm_quantized", pfc)
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
@@ -257,9 +301,6 @@ def quantize(input: Tensor,
     layer.axis = axis
 
     output = _create_tensor(layer.get_output(0), layer)
-
-    if not default_net().strongly_typed:
-        layer.get_output(0).dtype = str_dtype_to_trt(dtype)
 
     return output
 
@@ -308,11 +349,10 @@ def quantize_per_token(x: Tensor) -> Tuple[Tensor]:
         plug_inputs = [x.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "quantize_per_token_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)
-        quantized.trt_tensor.dtype = str_dtype_to_trt("int8")
         scales = _create_tensor(layer.get_output(1), layer)
-        scales.trt_tensor.dtype = str_dtype_to_trt("float32")
 
         return quantized, scales
 
@@ -334,7 +374,7 @@ def quantize_tensor(x, scale):
         plug_inputs = [x.trt_tensor, scale.trt_tensor]
         layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
         layer.get_output(0).set_dynamic_range(-127, 127)
+        _add_plugin_info(layer, plg_creator, "quantize_tensor_plugin", pfc)
 
         quantized = _create_tensor(layer.get_output(0), layer)
-        quantized.trt_tensor.dtype = str_dtype_to_trt("int8")
     return quantized

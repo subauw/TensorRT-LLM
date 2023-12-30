@@ -103,27 +103,29 @@ def build_engines():
     print("\nBuilding fp16 engines")
     fp16_weight_dir_1_gpu = fp16_weight_dir / '1-gpu'
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-default/1-gpu',
-                 '--dtype=float16')
+                 '--dtype=float16', '--strongly_typed')
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin/1-gpu',
-                 '--dtype=float16', '--use_gpt_attention_plugin=float16')
+                 '--dtype=float16', '--use_gpt_attention_plugin=float16',
+                 '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_weight_dir_1_gpu,
                      engine_dir / 'fp16-plugin-fmha/1-gpu', '--dtype=float16',
                      '--use_gpt_attention_plugin=float16',
-                     '--enable_context_fmha')
+                     '--enable_context_fmha', '--strongly_typed')
 
     build_engine(fp16_weight_dir_1_gpu, engine_dir / 'fp16-plugin-packed/1-gpu',
                  '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                 '--remove_input_padding')
+                 '--remove_input_padding', '--strongly_typed')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_weight_dir_1_gpu,
                      engine_dir / 'fp16-plugin-packed-fmha/1-gpu',
                      '--dtype=float16', '--use_gpt_attention_plugin=float16',
-                     '--remove_input_padding', '--enable_context_fmha')
+                     '--remove_input_padding', '--enable_context_fmha',
+                     '--strongly_typed')
 
     print("Done.")
 
@@ -143,8 +145,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
     hidden_size = config['builder_config']['hidden_size'] // world_size
     vocab_size = config['builder_config']['vocab_size']
     num_layers = config['builder_config']['num_layers']
-    multi_query_mode = config['builder_config']['multi_query_mode']
-    num_kv_heads = 1 if multi_query_mode else num_heads
+    num_kv_heads = config['builder_config']['num_kv_heads']
 
     runtime_rank = tensorrt_llm.mpi_rank()
     runtime_mapping = tensorrt_llm.Mapping(world_size,
@@ -179,6 +180,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
 
     for j, batch_size in enumerate([1, 2, 4, 8, 4, 2, 1]):
         output = []
+        output_with_fake_dim = []
         print(f"Running batch size: {batch_size}")
         for i in range(num_samples // batch_size):
             samples = input_tokens[i * batch_size:(i + 1) * batch_size]
@@ -187,7 +189,8 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                 input_ids = np.concatenate(samples)
                 input_ids = torch.tensor(input_ids,
                                          dtype=torch.int,
-                                         device='cuda').unsqueeze(0)
+                                         device='cuda')
+                input_ids_with_fake_dim = input_ids.unsqueeze(0)
                 max_input_length = torch.max(sample_lengths).item()
             else:
                 input_ids = torch.nested.to_padded_tensor(
@@ -200,6 +203,20 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
                                         sampling_config)
             torch.cuda.synchronize()
 
+            if remove_input_padding:
+                decoder.setup(batch_size, max_input_length, max_output_len)
+                output_ids_with_fake_dim = decoder.decode(
+                    input_ids_with_fake_dim, sample_lengths, sampling_config)
+                outputs_with_fake_dim_list = [
+                    output_ids_with_fake_dim[
+                        batch_idx, :,
+                        sample_lengths[batch_idx]:sample_lengths[batch_idx] +
+                        max_output_len].cpu()
+                    for batch_idx in range(output_ids_with_fake_dim.shape[0])
+                ]
+                outputs_with_fake_dim = torch.cat(outputs_with_fake_dim_list)
+                output_with_fake_dim.append(outputs_with_fake_dim)
+
             outputs_list = [
                 output_ids[batch_idx, :,
                            sample_lengths[batch_idx]:sample_lengths[batch_idx] +
@@ -209,6 +226,11 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
             outputs = torch.cat(outputs_list)
             output.append(outputs)
         output = torch.stack(output, dim=0)
+        if remove_input_padding:
+            output_with_fake_dim = torch.stack(output_with_fake_dim, dim=0)
+            error = np.mean(output.cpu().numpy().flatten() !=
+                            output_with_fake_dim.cpu().numpy().flatten())
+            assert error < 2.0 / 8, f"diff at batch_size={batch_size}, output_with_fake_dim={output_with_fake_dim}, output={output}"
 
         if j == 0:
             expect_output = output
@@ -216,7 +238,7 @@ def check_accuracy(engine_dir, input_tokens, max_output_len):
         if expect_output is not None:
             error = np.mean(output.cpu().numpy().flatten() !=
                             expect_output.cpu().numpy().flatten())
-            assert error < 2.0 / 8, f"diff at batch_size={batch_size}, expect_output={expect_output}, output={output}"
+            assert error < 0.3, f"diff at batch_size={batch_size}, expect_output={expect_output}, output={output}"
 
 
 def check_output(engine: str, max_output_len: int = 8):

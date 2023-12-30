@@ -40,7 +40,7 @@ class DType(Enum):
         if dst == 'trt_plugin_py':
             map = DType.get_map("dtype", 'trt_plugin')
             ret = map[self]
-            return ret[1:]  # skip the preceeding 'k'
+            return ret[1:]  # skip the proceeding 'k'
 
         map = DType.get_map("dtype", dst)
         ret = map[self]
@@ -269,7 +269,7 @@ class KernelMetaData:
         if yaml_path:
             with open(yaml_path, "r") as f:
                 yaml_str = f.read()
-        yaml_data = yaml.load(yaml_str, Loader=yaml.Loader)
+        yaml_data = yaml.safe_load(yaml_str)
 
         kernel_name = yaml_data["name"]
         ios = []
@@ -316,7 +316,14 @@ class KernelMetaData:
         logger.info(f"load {self.num_outputs} outputs")
         logger.info(f"load {self.num_constexprs} constexprs")
 
-        return yaml.dump(ret)
+        yaml.add_representer(
+            data_type=OrderedDict,
+            representer=lambda dumper, data: dumper.represent_mapping(
+                yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+                data.items(),
+            ),
+            Dumper=yaml.SafeDumper)
+        return yaml.safe_dump(ret)
 
     def to_triton_signatures(self) -> List[str]:
         '''
@@ -539,7 +546,7 @@ class PluginCppCodegen:
 
     @property
     def enqueue_body_arg_list(self) -> str:
-        # Here we add two additional arguments: stream and algo_id=0 for lauching the triton kernel
+        # Here we add two additional arguments: stream and algo_id=0 for launching the triton kernel
         return ", ".join(["stream"] +
                          [arg.name for arg in self.meta_data.arguments] + ['0'])
 
@@ -682,13 +689,12 @@ class PluginCmakeCodegen:
 
 
 def setup_jinja_env() -> jinja2.Environment:
-    env = jinja2.Environment(
-        loader=jinja2.PackageLoader(
-            package_name="tensorrt_llm.tools.plugin_gen",
-            package_path="templates",
-        ),
-        undefined=jinja2.StrictUndefined,
-    )
+    env = jinja2.Environment(loader=jinja2.PackageLoader(
+        package_name="tensorrt_llm.tools.plugin_gen",
+        package_path="templates",
+    ),
+                             undefined=jinja2.StrictUndefined,
+                             autoescape=jinja2.select_autoescape())
     env.variable_start_string = '[['
     env.variable_end_string = ']]'
     return env

@@ -18,29 +18,62 @@
 
 #include "tensorrt_llm/runtime/iTensor.h"
 
+#include <string>
+
 namespace tensorrt_llm::batch_manager
 {
-struct NamedTensor
+template <typename TTensor>
+class GenericNamedTensor
 {
-    using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
+public:
+    using TensorPtr = TTensor;
 
     TensorPtr tensor;
     std::string name;
 
-    NamedTensor() = default;
-    ~NamedTensor() = default;
+    GenericNamedTensor() = default;
+    ~GenericNamedTensor() = default;
 
-    // Host Tensor constructor
+    GenericNamedTensor(TensorPtr _tensor, std::string _name)
+        : tensor{std::move(_tensor)}
+        , name{std::move(_name)}
+    {
+    }
+
+    explicit GenericNamedTensor(std::string _name)
+        : tensor{}
+        , name{std::move(_name)}
+    {
+    }
+
+    TensorPtr operator()()
+    {
+        return tensor;
+    }
+
+    TensorPtr const& operator()() const
+    {
+        return tensor;
+    }
+};
+
+class NamedTensor : public GenericNamedTensor<tensorrt_llm::runtime::ITensor::SharedPtr>
+{
+public:
+    using Base = GenericNamedTensor<tensorrt_llm::runtime::ITensor::SharedPtr>;
+    using TensorPtr = Base::TensorPtr;
+
     NamedTensor(
         nvinfer1::DataType _type, std::vector<int64_t> const& _shape, std::string _name, const void* _data = nullptr);
 
     NamedTensor(TensorPtr _tensor, std::string _name)
-        : tensor(std::move(_tensor))
-        , name(std::move(_name))
-    {
-    }
+        : Base(std::move(_tensor), std::move(_name)){};
 
-    std::vector<int64_t> serialize();
+    explicit NamedTensor(std::string _name)
+        : Base(std::move(_name)){};
+
+    [[nodiscard]] std::vector<int64_t> serialize() const;
+
     static NamedTensor deserialize(const int64_t* packed);
 };
 } // namespace tensorrt_llm::batch_manager

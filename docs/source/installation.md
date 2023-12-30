@@ -1,6 +1,7 @@
-# Table of Contents
+# TensorRT-LLM Installation
 
 - [Overview](#overview)
+- [Install From the Wheel Package](#install-from-the-wheel-package)
 - [Fetch the Sources](#fetch-the-sources)
 - [Build TensorRT-LLM in One Step](#build-tensorrt-llm-in-one-step)
 - [Build Step-by-step](#build-step-by-step)
@@ -13,15 +14,28 @@
 
 ## Overview
 
-This document contains instructions to build TensorRT-LLM from sources. TensorRT-LLM depends on the latest versions of
-TensorRT and
-[Polygraphy](https://github.com/NVIDIA/TensorRT/tree/main/tools/Polygraphy)
-which are distributed separately, and should be copied into this repository.
-
+This document contains instructions to install TensorRT-LLM.
 We recommend the use of [Docker](https://www.docker.com) to build and run
 TensorRT-LLM. Instructions to install an environment to run Docker containers
 for the NVIDIA platform can be found
 [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
+## Install From the Wheel Package
+
+Please try installing using the wheel package first to save effort.
+
+After installing CUDA 12.2 according to the [instructions](https://developer.nvidia.com/cuda-toolkit), please execute the following commands to install TensorRT-LLM.
+
+```bash
+# Install dependencies, TensorRT-LLM requires Python 3.10
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev
+# Install the latest version of TensorRT-LLM
+pip3 install tensorrt_llm -U --extra-index-url https://pypi.nvidia.com
+# Check installation
+python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
+```
+
+Note that users who have debugging needs or use the C++11 ABI need to compile TensorRT-LLM from source.
 
 ## Fetch the Sources
 
@@ -145,11 +159,26 @@ example:
 
 ```bash
 # Build TensorRT-LLM for Ampere.
-python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
+python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --trt_root /usr/local/tensorrt
 ```
 
 The list of supported architectures can be found in the
 [`CMakeLists.txt`](source:cpp/CMakeLists.txt) file.
+
+### Build the Python Bindings for the C++ Runtime
+
+The C++ Runtime, in particular, [`GptSession`](source:cpp/include/tensorrt_llm/runtime/gptSession.h) can be exposed to
+Python via [bindings](source:cpp/tensorrt_llm/pybind/bindings.cpp). This is currently an opt-in feature which needs to be
+explicitly activated during compilation time. The corresponding option `--python_bindings` can be specified
+to `build_wheel.py` in the standard way:
+
+```bash
+python3 ./scripts/build_wheel.py --python_bindings --trt_root /usr/local/tensorrt
+```
+
+After installing the resulting wheel as described above, the C++ Runtime bindings will be available in
+package `tensorrt_llm.bindings`. Running `help` on this package in a Python interpreter will provide on overview of the
+relevant classes. The [associated unit tests](source:tests/bindings) should also be consulted for understanding the API.
 
 ### Link with the TensorRT-LLM C++ Runtime
 
@@ -194,5 +223,5 @@ headers contained under `cpp` should not be included directly since they might
 change in future versions.
 
 For examples of how to use the C++ runtime, see the unit tests in
-[gptSessionTest.cpp](cpp/tests/runtime/gptSessionTest.cpp) and the related
-[CMakeLists.txt](cpp/tests/CMakeLists.txt) file.
+[gptSessionTest.cpp](source:cpp/tests/runtime/gptSessionTest.cpp) and the related
+[CMakeLists.txt](source:cpp/tests/CMakeLists.txt) file.

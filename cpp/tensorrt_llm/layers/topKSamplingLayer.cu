@@ -17,15 +17,18 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <algorithm>
 #include <float.h>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
@@ -58,7 +61,7 @@ __global__ void setup_topk_runtime_args(int batch_size, uint32_t top_k, uint32_t
             // compatibility.
             p = 1.0f;
         }
-        // Clip k value. A topk sampling kernel supports up to TOP_K_MAX=64.
+        // Clip k value. A topk sampling kernel supports up to TOP_K_MAX.
         top_ks[i] = k > TOP_K_MAX ? TOP_K_MAX : k;
         if (k > TOP_K_MAX)
         {
@@ -84,7 +87,7 @@ __global__ void setup_topk_runtime_args(int batch_size, uint32_t top_k, uint32_t
 template <typename T>
 void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<uint32_t> const& top_k)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     uint32_t max_top_k = (top_k.size() > 0) ? *std::max_element(std::begin(top_k), std::end(top_k)) : 1;
     if (max_top_k == 0)
     {
@@ -93,7 +96,8 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<u
         max_top_k = 1;
     }
     invokeTopKSampling<T>(nullptr, sampling_workspace_size_, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, max_top_k, 1.0f, vocab_size_padded_, nullptr, stream_, batch_size, skip_decode_buf_);
+        nullptr, nullptr, max_top_k, 1.0f, vocab_size_padded_, nullptr, stream_, batch_size, skip_decode_buf_,
+        normalize_log_probs);
     sampling_workspace_ = allocator_->reMalloc(sampling_workspace_, sampling_workspace_size_, false);
     runtime_top_k_buf_ = allocator_->reMalloc(runtime_top_k_buf_, sizeof(uint32_t) * batch_size, false);
     runtime_top_p_buf_ = allocator_->reMalloc(runtime_top_p_buf_, sizeof(float) * batch_size, false);
@@ -103,7 +107,7 @@ void TopKSamplingLayer<T>::allocateBuffer(size_t const batch_size, std::vector<u
 template <typename T>
 void TopKSamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&sampling_workspace_));
@@ -117,7 +121,7 @@ void TopKSamplingLayer<T>::freeBuffer()
 template <typename T>
 void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     BaseSamplingLayer<T>::setupBase(batch_size, setupParams);
 
     uint32_t const default_top_k = 0;
@@ -128,6 +132,7 @@ void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& set
 
     size_t const runtime_top_k_size = runtime_top_k.size();
     size_t const runtime_top_p_size = runtime_top_p.size();
+    normalize_log_probs = setupParams.normalize_log_probs.has_value() && setupParams.normalize_log_probs.value();
 
     uint32_t const top_k = *std::max_element(std::begin(runtime_top_k), std::end(runtime_top_k));
     float const top_p = (runtime_top_p_size == 0) ? 0.0f : runtime_top_p.front();
@@ -149,8 +154,8 @@ void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& set
 
     dim3 block(std::min((int) batch_size, 256));
     dim3 grid(divUp((int) batch_size, (int) block.x));
-    // support top_k up to 1024.
-    setup_topk_runtime_args<1024><<<grid, block, 0, stream_>>>(batch_size, top_k, runtime_top_k_buf_,
+    // support top_k up to TOP_K_MAX.
+    setup_topk_runtime_args<TOP_K_MAX><<<grid, block, 0, stream_>>>(batch_size, top_k, runtime_top_k_buf_,
         runtime_top_k_size, top_p, runtime_top_p_buf_, runtime_top_p_size, skip_decode_buf_);
     cudaAutoCpy(skip_decode_, skip_decode_buf_, batch_size, stream_);
     std::vector<uint32_t> runtime_top_ks(batch_size);
@@ -161,7 +166,7 @@ void TopKSamplingLayer<T>::setup(size_t const batch_size, SetupParams const& set
 template <typename T>
 void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingParams const& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
@@ -171,9 +176,14 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
     auto* logits = !skip_any_ ? params.logits.template getPtr<T>() : runtime_logits_buf_;
     auto* end_ids = params.end_ids.template getPtr<const int>();
 
-    bool* finished = (outputs.finished) ? outputs.finished->template getPtr<bool>() : nullptr;
+    FinishedState* finished_input = (params.finished)
+        ? reinterpret_cast<FinishedState*>(params.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
+    FinishedState* finished_output = (outputs.finished)
+        ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
+        : nullptr;
     invokeAddBiasEndMask(
-        logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
+        logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_, vocab_size_padded_, stream_);
     sync_check_cuda_error();
 
     float* cum_log_probs = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : nullptr;
@@ -181,30 +191,31 @@ void TopKSamplingLayer<T>::runSampling(DecodingOutputParams& outputs, DecodingPa
 
     if (cum_log_probs != nullptr || output_log_probs != nullptr)
     {
-        invokeAddBiasSoftMax(
-            logits, (T*) (nullptr), end_ids, finished, local_batch_size, vocab_size_padded_, vocab_size_, stream_);
+        invokeAddBiasSoftMax(logits, logits, (T*) (nullptr), end_ids, finished_input, local_batch_size, vocab_size_,
+            vocab_size_padded_, stream_);
         sync_check_cuda_error();
     }
 
     int* sequence_length = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<int>() : nullptr;
 
     invokeBatchTopKSampling(sampling_workspace_, sampling_workspace_size_, logits,
-        outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished, cum_log_probs, output_log_probs,
-        curandstate_buf_ + ite * local_batch_size,
+        outputs.output_ids_ptr.template getPtr<int*>(), sequence_length, finished_input, finished_output, cum_log_probs,
+        output_log_probs, curandstate_buf_ + ite * local_batch_size,
         (int) runtime_max_top_k_, // useless because runtime_top_k_buf_ is never
                                   // nullptr. Keep for legacy.
         (int*) (runtime_top_k_buf_ + ite * local_batch_size),
         1.0f,                     // useless because runtime_top_p_buf_ is never nullptr. Keep for
                                   // legacy.
         runtime_top_p_buf_ + ite * local_batch_size, vocab_size_padded_, end_ids, stream_, local_batch_size,
-        skip_decode_buf_ + ite * local_batch_size);
+        skip_decode_buf_ + ite * local_batch_size, normalize_log_probs);
     sync_check_cuda_error();
 }
 
 template <typename T>
 TopKSamplingLayer<T>::TopKSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward)
-    : BaseSamplingLayer<T>(vocab_size, vocab_size_padded, stream, allocator, is_free_buffer_after_forward, nullptr)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward)
+    : BaseSamplingLayer<T>(
+        vocab_size, vocab_size_padded, stream, std::move(allocator), is_free_buffer_after_forward, nullptr)
 {
 }
 
@@ -217,7 +228,7 @@ TopKSamplingLayer<T>::TopKSamplingLayer(TopKSamplingLayer<T> const& top_k_sampli
 template <typename T>
 TopKSamplingLayer<T>::~TopKSamplingLayer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     freeBuffer();
 }
 

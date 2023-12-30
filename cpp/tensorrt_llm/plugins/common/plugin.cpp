@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/plugins/common/plugin.h"
+
+#include "tensorrt_llm/common/mpiUtils.h"
+
 #include "checkMacrosPlugin.h"
 #include "cuda.h"
 #include <cstdint>
@@ -43,6 +46,46 @@ std::map<std::set<int>, ncclComm_t>* getCommMap()
     static std::map<std::set<int>, ncclComm_t> commMap;
     return &commMap;
 }
+
+void initCommMap(std::set<int> const& group)
+{
+    auto& commMap = *getCommMap();
+    // [] operator inserts T() if it does not exist
+    if (isBuilding() || commMap[group] != nullptr)
+    {
+        return;
+    }
+    auto& comm = COMM_SESSION;
+    auto const myRank = comm.getRank();
+
+    int groupRank = 0;
+    for (int it : group)
+    {
+        if (it == myRank)
+        {
+            break;
+        }
+        ++groupRank;
+    }
+
+    ncclUniqueId id;
+    if (myRank == *group.begin())
+    {
+        ncclGetUniqueId(&id);
+        for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
+        {
+            comm.send(id, *it, 0);
+        }
+    }
+    else
+    {
+        comm.recv(id, *group.begin(), 0);
+    }
+
+    commMap[group] = nullptr;
+    NCCLCHECK(ncclCommInitRank(&commMap[group], group.size(), id, groupRank));
+}
+
 #endif // ENABLE_MULTI_DEVICE
 
 namespace
@@ -161,62 +204,6 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
             delete handle;
         });
     return creator();
-}
-
-// ALIGNPTR
-int8_t* tensorrt_llm::plugins::alignPtr(int8_t* ptr, uintptr_t to)
-{
-    uintptr_t addr = (uintptr_t) ptr;
-    if (addr % to)
-    {
-        addr += to - addr % to;
-    }
-    return (int8_t*) addr;
-}
-
-// NEXTWORKSPACEPTR
-int8_t* tensorrt_llm::plugins::nextWorkspacePtrCommon(
-    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
-{
-    uintptr_t addr = (uintptr_t) ptr;
-    addr += previousWorkspaceSize;
-    return alignPtr((int8_t*) addr, alignment);
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtr(int8_t* ptr, uintptr_t previousWorkspaceSize)
-{
-    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, kCudaMemAlign);
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtr(
-    int8_t* const base, uintptr_t& offset, const uintptr_t size, const uintptr_t alignment)
-{
-    uintptr_t curr_offset = offset;
-    uintptr_t next_offset = curr_offset + ((size + alignment - 1) / alignment) * alignment;
-    int8_t* newptr = size == 0 ? nullptr : base + curr_offset;
-    offset = next_offset;
-    return newptr;
-}
-
-int8_t* tensorrt_llm::plugins::nextWorkspacePtrWithAlignment(
-    int8_t* ptr, uintptr_t previousWorkspaceSize, const uintptr_t alignment)
-{
-    return nextWorkspacePtrCommon(ptr, previousWorkspaceSize, alignment);
-}
-
-// CALCULATE TOTAL WORKSPACE SIZE
-size_t tensorrt_llm::plugins::calculateTotalWorkspaceSize(size_t* workspaces, int count, const uintptr_t alignment)
-{
-    size_t total = 0;
-    for (int i = 0; i < count; i++)
-    {
-        total += workspaces[i];
-        if (workspaces[i] % alignment)
-        {
-            total += alignment - (workspaces[i] % alignment);
-        }
-    }
-    return total;
 }
 
 PluginFieldParser::PluginFieldParser(int32_t nbFields, nvinfer1::PluginField const* fields)

@@ -15,7 +15,9 @@
 include(FetchContent)
 
 set(SRCS
+    utils/numpyUtils.cpp
     utils/sessionUtils.cpp
+    utils/debugUtils.cu
     bufferManager.cpp
     decodingOutput.cpp
     gptDecoder.cpp
@@ -27,6 +29,7 @@ set(SRCS
     ipcUtils.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
+    promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
     statefulGptDecoder.cpp
@@ -39,6 +42,10 @@ include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 if(NOT MSVC)
   # additional warnings
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  if(WARNING_IS_ERROR)
+    message(STATUS "Treating warnings as errors in GCC compilation")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+  endif()
 else() # Windows
   # warning level 4
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
@@ -48,7 +55,7 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-target_include_directories(runtime_src PRIVATE ${MPI_INCLUDE_PATH})
+target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})

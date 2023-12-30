@@ -33,11 +33,13 @@ namespace layers
 template <typename T>
 void BaseSamplingLayer<T>::allocateBuffer(size_t batch_size)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     curandstate_buf_ = allocator_->reMalloc(curandstate_buf_, sizeof(curandState_t) * batch_size, false);
-    random_seeds_buf_ = allocator_->reMalloc(random_seeds_buf_, sizeof(unsigned long long) * batch_size, false);
+    random_seeds_buf_ = allocator_->reMalloc(random_seeds_buf_, sizeof(uint64_t) * batch_size, false);
     temperature_buf_ = allocator_->reMalloc(temperature_buf_, sizeof(float) * batch_size, false);
     repetition_penalty_buf_ = allocator_->reMalloc(repetition_penalty_buf_, sizeof(float) * batch_size, false);
+    presence_penalty_buf_ = allocator_->reMalloc(presence_penalty_buf_, sizeof(float) * batch_size, false);
+    frequency_penalty_buf_ = allocator_->reMalloc(frequency_penalty_buf_, sizeof(float) * batch_size, false);
     min_lengths_buf_ = allocator_->reMalloc(min_lengths_buf_, sizeof(int) * batch_size, false);
     runtime_logits_buf_ = allocator_->reMalloc(runtime_logits_buf_, sizeof(T) * batch_size * vocab_size_padded_, false);
     skip_decode_buf_ = allocator_->reMalloc(skip_decode_buf_, sizeof(bool) * batch_size, false);
@@ -52,13 +54,15 @@ void BaseSamplingLayer<T>::allocateBuffer(size_t batch_size)
 template <typename T>
 void BaseSamplingLayer<T>::freeBuffer()
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     if (is_allocate_buffer_)
     {
         allocator_->free((void**) (&curandstate_buf_));
         allocator_->free((void**) (&random_seeds_buf_));
         allocator_->free((void**) (&temperature_buf_));
         allocator_->free((void**) (&repetition_penalty_buf_));
+        allocator_->free((void**) (&presence_penalty_buf_));
+        allocator_->free((void**) (&frequency_penalty_buf_));
         allocator_->free((void**) (&min_lengths_buf_));
         allocator_->free((void**) (&runtime_logits_buf_));
         allocator_->free((void**) (&skip_decode_buf_));
@@ -69,8 +73,8 @@ void BaseSamplingLayer<T>::freeBuffer()
 
 template <typename T>
 BaseSamplingLayer<T>::BaseSamplingLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
-    IAllocator* allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
-    : BaseLayer(stream, allocator, is_free_buffer_after_forward, cuda_device_prop)
+    std::shared_ptr<IAllocator> allocator, bool is_free_buffer_after_forward, cudaDeviceProp* cuda_device_prop)
+    : BaseLayer(stream, std::move(allocator), is_free_buffer_after_forward, cuda_device_prop)
     , vocab_size_(vocab_size)
     , vocab_size_padded_(vocab_size_padded)
 {
@@ -93,7 +97,7 @@ BaseSamplingLayer<T>::~BaseSamplingLayer()
 template <typename T>
 void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const& setupParams)
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE(__PRETTY_FUNCTION__);
     allocateBuffer(batch_size);
 
     // If runtime argument has single random seed, using this random seed to
@@ -101,17 +105,17 @@ void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const&
     // [batch_size] random seeds, initializing the random table by different
     // random seeds respectively. If no random seed, initialize the random table
     // of all sentences by 0 directly.
-    if (setupParams.random_seed)
+    if (setupParams.randomSeed)
     {
-        if (setupParams.random_seed->size() == 1)
+        if (setupParams.randomSeed->size() == 1)
         {
-            invokeCurandInitialize(curandstate_buf_, batch_size, setupParams.random_seed->front(), stream_);
+            invokeCurandInitialize(curandstate_buf_, batch_size, setupParams.randomSeed->front(), stream_);
             sync_check_cuda_error();
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(setupParams.random_seed->size() == batch_size, "Random seed vector size mismatch.");
-            cudaAutoCpy(random_seeds_buf_, setupParams.random_seed->data(), batch_size, stream_);
+            TLLM_CHECK_WITH_INFO(setupParams.randomSeed->size() == batch_size, "Random seed vector size mismatch.");
+            cudaAutoCpy(random_seeds_buf_, setupParams.randomSeed->data(), batch_size, stream_);
             invokeCurandBatchInitialize(curandstate_buf_, batch_size, random_seeds_buf_, stream_);
             sync_check_cuda_error();
         }
@@ -144,33 +148,32 @@ void BaseSamplingLayer<T>::setupBase(const size_t batch_size, SetupParams const&
     };
 
     fillBuffers(setupParams.temperature, 1.0f, mTemperature, temperature_buf_);
-    fillBuffers(setupParams.min_length, 1, mMinLengths, min_lengths_buf_);
+    fillBuffers(setupParams.min_length, 0, mMinLengths, min_lengths_buf_);
 
-    if ((setupParams.repetition_penalty) || (setupParams.presence_penalty))
+    use_repetition_penalty_ = static_cast<bool>(setupParams.repetition_penalty);
+    use_presence_penalty_ = static_cast<bool>(setupParams.presence_penalty);
+    use_frequency_penalty_ = static_cast<bool>(setupParams.frequency_penalty);
+    if (use_repetition_penalty_)
     {
-        TLLM_CHECK_WITH_INFO(!((setupParams.repetition_penalty) && (setupParams.presence_penalty)),
-            "Found ambiguous parameters repetition_penalty and presence_penalty "
-            "which are mutually exclusive. "
-            "Please provide one of repetition_penalty or presence_penalty.");
-        repetition_penalty_type_ = (setupParams.repetition_penalty) ? RepetitionPenaltyType::Multiplicative
-                                                                    : RepetitionPenaltyType::Additive;
-        auto const& repetition_penalty = (repetition_penalty_type_ == RepetitionPenaltyType::Multiplicative)
-            ? setupParams.repetition_penalty
-            : setupParams.presence_penalty;
-
-        // repetition_penalty is not empty, so default value 0.0f has no effect
-        fillBuffers(repetition_penalty, 0.0f, mRepetitionPenalty, repetition_penalty_buf_);
+        fillBuffers(setupParams.repetition_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Repetition),
+            mRepetitionPenalty, repetition_penalty_buf_);
     }
-    else
+    if (use_presence_penalty_)
     {
-        repetition_penalty_type_ = RepetitionPenaltyType::None;
+        fillBuffers(setupParams.presence_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Presence),
+            mPresencePenalty, presence_penalty_buf_);
+    }
+    if (use_frequency_penalty_)
+    {
+        fillBuffers(setupParams.frequency_penalty, getDefaultPenaltyValue(RepetitionPenaltyType::Frequency),
+            mFrequencyPenalty, frequency_penalty_buf_);
     }
 }
 
 template <typename T>
 void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams const& params)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batch_size = outputs.output_ids_ptr.shape[0];
     auto const local_batch_size = params.logits.shape[0];
@@ -196,7 +199,7 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
         // a batch in the same step. We copy the logits to an internal buffer, not
         // affecting the other sampling layers.
         TLLM_CHECK(params.logits.size() == local_batch_size * vocab_size_padded_);
-        cudaD2Dcpy(runtime_logits_buf_, logits, params.logits.size());
+        cudaD2Dcpy(runtime_logits_buf_, logits, params.logits.size(), stream_);
         logits = runtime_logits_buf_;
     }
 
@@ -209,17 +212,25 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
     }
     sync_check_cuda_error();
 
-    if (step > 1 && repetition_penalty_type_ != RepetitionPenaltyType::None)
+    if (step > 1)
     {
-        float default_value = getDefaultPenaltyValue(repetition_penalty_type_);
-        if (!ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float, default_value))
+        const bool use_repetition = use_repetition_penalty_
+            && (!ALL_OF(std::begin(mRepetitionPenalty) + ite * local_batch_size, local_batch_size, float,
+                getDefaultPenaltyValue(RepetitionPenaltyType::Repetition)));
+        const bool use_presence = use_presence_penalty_
+            && (!ALL_OF(std::begin(mPresencePenalty) + ite * local_batch_size, local_batch_size, float,
+                getDefaultPenaltyValue(RepetitionPenaltyType::Presence)));
+        const bool use_frequency = use_frequency_penalty_
+            && (!ALL_OF(std::begin(mFrequencyPenalty) + ite * local_batch_size, local_batch_size, float,
+                getDefaultPenaltyValue(RepetitionPenaltyType::Frequency)));
+
+        if (use_repetition || use_presence || use_frequency)
         {
-            auto* const input_lengths
-                = params.input_lengths ? params.input_lengths->template getPtr<const int>() : nullptr;
             invokeBatchApplyRepetitionPenalty(logits, repetition_penalty_buf_ + ite * local_batch_size,
-                outputs.output_ids_ptr.template getPtr<const int*>(), outputs.sequence_length->getPtr<const int>(),
-                batch_size, local_batch_size, vocab_size_padded_, input_lengths, repetition_penalty_type_,
-                params.max_seq_len, stream_);
+                presence_penalty_buf_ + ite * local_batch_size, frequency_penalty_buf_ + ite * local_batch_size,
+                use_repetition, use_presence, use_frequency, outputs.output_ids_ptr.template getPtr<const int*>(),
+                outputs.sequence_length->getPtr<const int>(), batch_size, vocab_size_padded_, params.max_seq_len,
+                stream_);
             sync_check_cuda_error();
         }
     }
@@ -237,7 +248,7 @@ void BaseSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams 
         freeBuffer();
     }
     sync_check_cuda_error();
-    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template class BaseSamplingLayer<float>;

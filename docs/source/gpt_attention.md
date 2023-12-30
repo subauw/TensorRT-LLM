@@ -94,6 +94,12 @@ multi-block version to become more efficient than the "vanilla" implementation
 that uses a single CUDA thread-block per head. It is controlled by an internal
 heuristic._
 
+Another note is that as the masked MHA kernels use shared memory size
+proportional to sequence length, so there can be some cases that GPU's shared
+memory is not enough when multi-block mode is not enabled. To get masked MHA
+kernel work in these cases, multi-block mode is forced on and a warning log is
+printed.
+
 ## Inflight batching
 
 TensorRT-LLM supports a feature called in-flight batching. With that feature,
@@ -164,6 +170,33 @@ the MHA/MQA kernel. The scaling factor to dequantize those values is stored in
 the `kv_quant_orig_scale` tensor. That tensor contains a single value (per
 tensor scaling).
 
+
+## Sliding Window Attention, Cyclic (Rolling Buffer) KV Cache
+
+TensorRT-LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
+as a circular buffer. This means that it only stores the kv cache for the last N
+tokens, where N is determined by the `max_attention_window_size` parameter in
+`GenerationSession.setup`. You can see examples of this in the `run.py` or
+`summarize.py` files. When the cache is full, new tokens’ kv cache will
+overwrite the "least recently used" caches.
+
+In the context phase, if the input length surpasses the `max_attention_window_size`,
+`Sliding Window Attention` will be activated. This serves the same function as
+the `sliding window_size`.
+
+This feature helps to reduce the memory footprint of the kv cache when
+dealing with very long sequences.
+
+_Note that the cyclic kv cache feature doesn't work with beam searching currently as
+the context kv cache are shared across beams.
+
+_The experimental feature, which allows different `max_attention_window_size` values
+for each layer, is also supported. To utilize this feature, simply provide an
+`int32 torch.Tensor` with a shape of `[num_layers]` to the `GenerationSession.setup`.
+This tensor will serve as the buffer for `max_attention_window_size`,
+setting unique values for each layer. However, it’s important to note that the
+memory allocation for the kv cache still relies on the buffer’s maximum value._
+
 ## Beam-Search
 
 The GPT attention operator supports beam-search. In the context phase, a single
@@ -189,7 +222,7 @@ where `batch_beam_size` is the batch size (number of sequences) for the context
 phase and the batch size multiplied by the beam width for the generation phase.
 Having different beam widths per sequence in padded mode is not supported.
 
-In packed mode, its shape is `[1, num_tokens, 3 * hidden_dim]` where
+In packed mode, its shape is `[num_tokens, 3 * hidden_dim]` where
 `num_tokens` is the total number of tokens in the batch. For the sequences in
 context phase, the number of tokens of a sequence corresponds to its input
 length (even if the beam width is greater than `1` for beam search).  For the
@@ -208,13 +241,6 @@ for seq in context_phase:
 for seq in generation_phase:
     num_tokens += seq.beam_width
 ```
-
-In a future release of TensorRT-LLM, the rank of that packed input tensor
-may be reduced from 3 to 2. The current rank is to maintain the homogeneity
-between padded and packed modes. It is no longer justified if support for
-padded mode is removed.
-
-## Additional Features
 
 ### Rotary Positional Embedding (RoPE)
 
@@ -237,7 +263,7 @@ In MHA, the output of the `Q*K^T` product is scaled by a constant value that
 is computed as:
 
 ```
-scaling = 1.f / (q_scaling * sqrt(head_size)).
+norm_factor = 1.f / (q_scaling * sqrt(head_size)).
 ```
 
 ### Cross Attention

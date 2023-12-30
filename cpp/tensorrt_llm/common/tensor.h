@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -227,16 +228,12 @@ public:
     std::string toString() const;
     std::string getNumpyTypeDesc(DataType type) const;
 
-    void saveNpy(const std::string& filename) const;
-    static Tensor loadNpy(const std::string& npy_file, const MemoryType where);
-
-    static DataType typeFromNumpyDesc(std::string type);
     static size_t getTypeSize(DataType type);
 
     template <typename T>
     inline T getVal(size_t index) const
     {
-        TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         TLLM_CHECK(where == MEMORY_CPU);
         TLLM_CHECK(data != nullptr);
         TLLM_CHECK_WITH_INFO(index < size(), "index is larger than buffer size");
@@ -252,7 +249,7 @@ public:
     template <typename T>
     inline T getVal() const
     {
-        TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         if (getTensorType<T>() != type)
         {
             TLLM_LOG_DEBUG("getVal with type %s, but data type is: %s", getNumpyTypeDesc(getTensorType<T>()).c_str(),
@@ -264,7 +261,7 @@ public:
     template <typename T>
     inline T* getPtr() const
     {
-        TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         if (getTensorType<T>() != type)
         {
             TLLM_LOG_DEBUG("getPtr with type %s, but data type is: %s", getNumpyTypeDesc(getTensorType<T>()).c_str(),
@@ -275,7 +272,7 @@ public:
 
     inline void* getPtrWithOffset(size_t offset) const
     {
-        TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         if (data == nullptr)
         {
             return (void*) data;
@@ -290,7 +287,7 @@ public:
     template <typename T>
     inline T* getPtrWithOffset(size_t offset) const
     {
-        TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         if (getTensorType<T>() != type)
         {
             TLLM_LOG_DEBUG("getVal with type %s, but data type is: %s", getNumpyTypeDesc(getTensorType<T>()).c_str(),
@@ -413,10 +410,6 @@ public:
     }
 
     Tensor slice(std::vector<size_t> shape, size_t offset = 0) const;
-
-private:
-    static void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data);
-    static int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, DataType& type, std::vector<size_t>& shape);
 };
 
 class TensorMap
@@ -438,7 +431,7 @@ public:
 
     inline bool contains(const std::string& key) const
     {
-        TLLM_LOG_DEBUG("%s for key: %s", __PRETTY_FUNCTION__, key.c_str());
+        TLLM_LOG_TRACE("%s for key: %s", __PRETTY_FUNCTION__, key.c_str());
         return tensor_map_.find(key) != tensor_map_.end();
     }
 
@@ -471,7 +464,7 @@ public:
 
     inline Tensor& at(const std::string& key)
     {
-        TLLM_LOG_DEBUG("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
+        TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         TLLM_CHECK_WITH_INFO(contains(key),
             fmtstr(
                 "Cannot find a tensor of name %s in the tensor map (keys: %s)", key.c_str(), vec2str(keys()).c_str()));
@@ -496,7 +489,7 @@ public:
 
     inline Tensor& at(const std::string& key, Tensor& default_tensor)
     {
-        TLLM_LOG_DEBUG("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
+        TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
         {
             return tensor_map_.at(key);
@@ -506,7 +499,7 @@ public:
 
     inline Tensor at(const std::string& key, Tensor& default_tensor) const
     {
-        TLLM_LOG_DEBUG("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
+        TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
         {
             return tensor_map_.at(key);
@@ -516,7 +509,7 @@ public:
 
     inline Tensor& at(const std::string& key, Tensor&& default_tensor)
     {
-        TLLM_LOG_DEBUG("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
+        TLLM_LOG_TRACE("%s for key %s", __PRETTY_FUNCTION__, key.c_str());
         if (contains(key))
         {
             return tensor_map_.at(key);
@@ -638,8 +631,6 @@ public:
     }
 
     std::string toString();
-    static TensorMap fromNpyFolder(const std::string& base_folder);
-    void saveNpy(const std::string& base_folder);
 };
 
 } // namespace common

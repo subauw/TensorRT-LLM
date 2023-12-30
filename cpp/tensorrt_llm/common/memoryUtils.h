@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 
 #include <cassert>
 
@@ -47,7 +46,7 @@ template <typename T>
 void cudaH2Dcpy(T* tgt, const T* src, const size_t size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, const T* src, const size_t size);
+void cudaD2Dcpy(T* tgt, const T* src, const size_t size, cudaStream_t stream = NULL);
 
 template <typename T>
 void cudaAutoCpy(T* tgt, const T* src, const size_t size, cudaStream_t stream = NULL);

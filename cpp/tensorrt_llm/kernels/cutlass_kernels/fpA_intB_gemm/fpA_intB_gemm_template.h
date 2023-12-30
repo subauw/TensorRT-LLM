@@ -19,9 +19,9 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // #ifndef _WIN32
 
-#include "cutlass/gemm/device/gemm_universal_base.h"
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/gemm/device/gemm_universal_base_compat.h"
 
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
@@ -124,7 +124,7 @@ void generic_mixed_gemm_kernelLauncher(const T* A, const WeightType* B, const T*
         return;
     }
 
-    using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
+    using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
 
     const int ldb = cutlass::platform::is_same<cutlass::layout::RowMajor, typename MixedGemmArchTraits::LayoutB>::value
         ? n
@@ -453,7 +453,7 @@ void CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::gemm(const void* A, const
 
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
-        dispatch_to_arch<tkc::EpilogueOpNoBias>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
+        dispatch_to_arch<tkc::EpilogueOpDefault>((const T*) A, (const WeightType*) B, (const T*) weight_scales, nullptr,
             nullptr, (T*) C, m, n, k, k, gemmConfig, workspace_ptr, workspace_bytes, stream, nullptr);
     }
     else
@@ -466,7 +466,8 @@ template <typename T, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp>
 std::vector<tkc::CutlassGemmConfig> CutlassFpAIntBGemmRunner<T, WeightType, QuantOp>::getConfigs() const
 {
     static constexpr bool is_weight_only = !std::is_same<T, WeightType>::value;
-    std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(sm_, is_weight_only, false);
+    std::vector<tkc::CutlassGemmConfig> candidateConfigs
+        = get_candidate_configs(sm_, is_weight_only, false, false, SPLIT_K_LIMIT);
     return candidateConfigs;
 }
 

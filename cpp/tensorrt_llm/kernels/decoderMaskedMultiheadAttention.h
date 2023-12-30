@@ -102,9 +102,12 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
-    // The sequence length.
-    // TODO: change name max_seq_len
-    int memory_max_len = 0;
+    // By default, max_attention_window_size == cyclic_attention_window_size
+    // unless each layer has different cyclic kv cache length.
+    // Max cache capacity (used to allocate KV cache)
+    int max_attention_window_size = 0;
+    // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
+    int cyclic_attention_window_size = 0;
     // The number of heads (H).
     int num_heads = 0;
     // Controls MHA/MQA/GQA
@@ -148,7 +151,7 @@ struct Multihead_attention_params_base
     bool fp8_kv_cache = false;
 
     // Multi-block setups
-    bool multi_block_mode = false;
+    mutable bool multi_block_mode = false;
 
     // Number of streaming processors on the device.
     // Tune block size to maximum occupancy.
@@ -157,6 +160,7 @@ struct Multihead_attention_params_base
     mutable int timesteps_per_block = -1;
     mutable int seq_len_tile = -1;
 
+    mutable int min_seq_len_tile = -1;
     mutable int max_seq_len_tile = -1;
     // The partial output buffer. Dimensions max_seq_len_tile x B x D. (for each timestep only seq_len_tile x B x D is
     // needed)
@@ -233,6 +237,24 @@ DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 #undef DECLARE_MMHA_NORMAL_AND_PAGED
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block)
+{
+    const auto qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
+    int size_per_elts = 16;
+    const auto qk_sz = qk_elts * 16;
+    size_t logits_sz = 0;
+#ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
+    if (sizeof(T) != 4)
+    {
+        size_per_elts += 4 * sizeof(T);
+    }
+#endif
+    int elts_per_block = max_dynamic_shmem_per_block / size_per_elts;
+    int min_block_count = (qk_elts + elts_per_block - 1) / elts_per_block;
+    return std::max(1, min_block_count);
+}
 
 } // namespace kernels
 } // namespace tensorrt_llm

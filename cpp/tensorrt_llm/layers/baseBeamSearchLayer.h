@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/beamSearchTopkKernels.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -42,8 +43,8 @@ class BaseBeamSearchLayer : public BaseLayer
 public:
     using SetupParams = DecodingSetupParams;
 
-    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream, tc::IAllocator* allocator,
-        bool is_free_buffer_after_forward);
+    BaseBeamSearchLayer(size_t vocab_size, size_t vocab_size_padded, cudaStream_t stream,
+        std::shared_ptr<tc::IAllocator> allocator, bool is_free_buffer_after_forward);
 
     BaseBeamSearchLayer(BaseBeamSearchLayer<T> const& beam_search_layer);
 
@@ -54,15 +55,17 @@ public:
     class ForwardParams : public SoftmaxParams
     {
     public:
-        ForwardParams(
-            int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection, int max_seq_len)
+        ForwardParams(int step, int ite, tc::Tensor logits, tc::Tensor endIds, tc::Tensor src_cache_indirection,
+            int max_attention_window, int max_seq_len)
             : SoftmaxParams(step, ite, std::move(logits), std::move(endIds))
             , src_cache_indirection{std::move(src_cache_indirection)}
+            , max_attention_window{max_attention_window}
             , max_seq_len{max_seq_len}
         {
         }
 
         // mandatory parameters
+        int max_attention_window;
         int max_seq_len;
         tc::Tensor src_cache_indirection; // [local_batch_size, beam_width, max_seq_len]
 
@@ -101,23 +104,32 @@ protected:
     size_t topk_softmax_workspace_size_;
     void* topk_softmax_workspace_ = nullptr;
 
-    float mTemperature;
-    int mMinLength;
-    float mRepetitionPenalty;
-    tensorrt_llm::kernels::RepetitionPenaltyType mRepetitionPenaltyType;
-
-    virtual void allocateBuffer(size_t batch_size, size_t beam_width) = 0;
+    std::vector<float> mTemperature;
+    std::vector<int> mMinLength;
+    std::vector<float> mRepetitionPenalty;
+    std::vector<float> mPresencePenalty;
+    std::vector<float> mFrequencyPenalty;
+    float* temperature_buf_;
+    int* min_lengths_buf_;
+    float* repetition_penalty_buf_;
+    float* presence_penalty_buf_;
+    float* frequency_penalty_buf_;
+    bool use_repetition_penalty_ = false;
+    bool use_presence_penalty_ = false;
+    bool use_frequency_penalty_ = false;
 
     virtual void invokeSoftMax(BeamSearchOutputParams& outputs, SoftmaxParams const& params) = 0;
 
-    void setupBase(SetupParams const& setupParams);
+    void setupBase(size_t batch_size, SetupParams const& setupParams);
 
 private:
+    void allocateBuffer(size_t batch_size);
     void freeBuffer();
 };
 
 void update_indir_cache_kernelLauncher(int* tgt_indir_cache, const int* src_indir_cache, const int* beam_ids,
-    const bool* finished, int batch_dim, int beam_width, int max_seq_len, int ite, cudaStream_t stream);
+    const tensorrt_llm::kernels::FinishedState* finished, int batch_dim, int beam_width, int max_seq_len, int ite,
+    cudaStream_t stream);
 
 } // namespace layers
 } // namespace tensorrt_llm

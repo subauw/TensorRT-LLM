@@ -41,20 +41,13 @@ FtDynamicDecode<T>::FtDynamicDecode(
             "vocab_size (%ld) is not multiple of tensor_para_size (%d).", vocab_size_padded_, tensor_para_size));
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    allocator_ = new tensorrt_llm::thop::TorchAllocator(stream);
+    auto allocator = std::make_shared<tensorrt_llm::thop::TorchAllocator>(stream);
 
     cudaDeviceProp prop;
     tensorrt_llm::common::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
-    dynamic_decode_layer_ = new tensorrt_llm::layers::DynamicDecodeLayer<T>(
-        vocab_size_, vocab_size_padded_, stream, allocator_, false, &prop_);
-}
-
-template <typename T>
-FtDynamicDecode<T>::~FtDynamicDecode()
-{
-    delete dynamic_decode_layer_;
-    delete allocator_;
+    dynamic_decode_layer_ = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
+        vocab_size_, vocab_size_padded_, stream, std::move(allocator), false, &prop_);
 }
 
 namespace
@@ -108,10 +101,10 @@ template <typename T>
 void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
     th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
     th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-    th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-    th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-    th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-    th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
+    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
 {
     // unused: length_penalty_opt, beam_search_diversity_rate_opt
 
@@ -125,28 +118,28 @@ void FtDynamicDecode<T>::setup(size_t batch_size, size_t beam_width, th::optiona
     safeInsert(temperature_opt, setupParams.temperature);
     safeInsert(repetition_penalty_opt, setupParams.repetition_penalty);
     safeInsert(presence_penalty_opt, setupParams.presence_penalty);
+    safeInsert(frequency_penalty_opt, setupParams.frequency_penalty);
     safeInsert(min_length_opt, setupParams.min_length);
-    safeInsert(random_seed_opt, setupParams.random_seed);
+    safeInsert(random_seed_opt, setupParams.randomSeed);
     safeInsert(top_p_decay_opt, setupParams.top_p_decay);
     safeInsert(top_p_min_opt, setupParams.top_p_min);
     safeInsert(top_p_reset_ids_opt, setupParams.top_p_reset_ids);
-
-    safeUpdateScalar(
-        beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate, "beam_search_diversity_rate");
-    safeUpdateScalar(length_penalty_opt, setupParams.length_penalty, "length_penalty");
+    safeInsert(beam_search_diversity_rate_opt, setupParams.beam_search_diversity_rate);
+    safeInsert(length_penalty_opt, setupParams.length_penalty);
 
     dynamic_decode_layer_->setup(batch_size, beam_width, setupParams);
 }
 
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width, hidden_size)
-    int step, int max_input_length, uint64_t ite, int local_batch_size, th::Tensor end_id,
+    int step, int max_input_length, int max_attention_window, uint64_t ite, int local_batch_size, th::Tensor end_id,
     th::optional<th::Tensor> embedding_bias_opt, th::optional<th::Tensor> input_lengths_opt,
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // Outputs
-    th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop, th::optional<th::Tensor> finished_opt,
+    th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+    th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
     th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> parent_ids_opt,
     th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_tgt_opt,
@@ -158,8 +151,8 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
 {
     auto const& logits_converted = convert_tensor<float>(logits);
     auto const& end_ids_converted = convert_tensor<int>(end_id);
-    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{
-        step, static_cast<int>(ite), max_input_length, local_batch_size, logits_converted, end_ids_converted};
+    typename tensorrt_llm::layers::DynamicDecodeLayer<T>::ForwardParams forwardParams{step, static_cast<int>(ite),
+        max_input_length, max_attention_window, local_batch_size, logits_converted, end_ids_converted};
 
     safeUpdate<int>(src_cache_indirection_opt, forwardParams.src_cache_indirection);
     safeUpdate<int>(sequence_limit_length_opt, forwardParams.sequence_limit_length);
@@ -168,12 +161,13 @@ void FtDynamicDecode<T>::forward(th::Tensor& logits, // (batch_size, beam_width,
     safeUpdate<int>(bad_words_list_opt, forwardParams.bad_words_list);
     safeUpdate<int>(stop_words_list_opt, forwardParams.stop_words_list);
     safeUpdate<int>(no_repeat_ngram_size_opt, forwardParams.no_repeat_ngram_size);
+    safeUpdate<uint8_t>(finished_input, forwardParams.finished);
 
     auto const& output_ids_converted = convert_tensor<int>(output_token_ids);
     typename tensorrt_llm::layers::DynamicDecodeLayer<T>::OutputParams outputParams{output_ids_converted};
     outputParams.newTokens = std::move(convert_tensor<int>(newTokens));
 
-    safeUpdate<bool>(finished_opt, outputParams.finished);
+    safeUpdate<uint8_t>(finished_output, outputParams.finished);
     std::int32_t* finished_sum_host = nullptr;
     if (forwardParams.sequence_limit_length && outputParams.finished.has_value())
     {
@@ -223,11 +217,6 @@ DynamicDecodeOp::DynamicDecodeOp(const int64_t vocab_size, const int64_t vocab_s
     createInstance();
 }
 
-DynamicDecodeOp::~DynamicDecodeOp()
-{
-    // Do nothing.
-}
-
 void DynamicDecodeOp::createInstance()
 {
     dynamic_decode_.reset();
@@ -248,10 +237,10 @@ void DynamicDecodeOp::createInstance()
 void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional<th::Tensor> runtime_top_k_opt,
     th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
     th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-    th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-    th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-    th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-    th::optional<th::Tensor> top_p_reset_ids_opt)
+    th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
+    th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     CHECK_OPTIONAL_CPU_INPUT(runtime_top_k_opt, torch::kInt32);
@@ -260,6 +249,7 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
     CHECK_OPTIONAL_CPU_INPUT(temperature_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(repetition_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(presence_penalty_opt, torch::kFloat);
+    CHECK_OPTIONAL_CPU_INPUT(frequency_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(min_length_opt, torch::kInt32);
     CHECK_OPTIONAL_CPU_INPUT(length_penalty_opt, torch::kFloat);
     CHECK_OPTIONAL_CPU_INPUT(beam_search_diversity_rate_opt, torch::kFloat);
@@ -269,19 +259,21 @@ void DynamicDecodeOp::setup(int64_t batch_size, int64_t beam_width, th::optional
     CHECK_OPTIONAL_INPUT(top_p_reset_ids_opt, torch::kInt32);
 
     dynamic_decode_->setup(static_cast<size_t>(batch_size), static_cast<size_t>(beam_width), runtime_top_k_opt,
-        runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, min_length_opt,
-        length_penalty_opt, beam_search_diversity_rate_opt, random_seed_opt, top_p_decay_opt, top_p_min_opt,
-        top_p_reset_ids_opt);
+        runtime_top_p_opt, temperature_opt, repetition_penalty_opt, presence_penalty_opt, frequency_penalty_opt,
+        min_length_opt, length_penalty_opt, beam_search_diversity_rate_opt, random_seed_opt, top_p_decay_opt,
+        top_p_min_opt, top_p_reset_ids_opt);
 }
 
-th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length, int64_t ite,
-    int64_t local_batch_size, th::Tensor end_id, th::optional<th::Tensor> embedding_bias_opt,
+th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max_input_length,
+    int64_t max_attention_window, int64_t ite, int64_t local_batch_size, th::Tensor end_id,
+    th::optional<th::Tensor> embedding_bias_opt,
     th::optional<th::Tensor> input_lengths_opt, // length of input contexts.
     th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_opt,
     th::optional<th::Tensor> bad_words_list_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
     th::optional<th::Tensor> src_cache_indirection_opt,
     // output buffers.
-    th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_opt,
+    th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
+    th::optional<th::Tensor> finished_output,
     th::optional<th::Tensor> seuqence_lengths_opt, // length of the current sequences.
     th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
     th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -311,14 +303,11 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     CHECK_INPUT(logits, scalar_type_);
     TLLM_CHECK_WITH_INFO(logits.dim() == 3,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, vocab_size_padded), "
-                                     "but got dim=%d shape=%s",
-            (int) logits.dim(), tensorrt_llm::common::vec2str(convert_shape(logits)).c_str())
-            .c_str());
+        "logits is of shape (batch_size, beam_width, vocab_size_padded), but got dim=%d shape=%s", (int) logits.dim(),
+        tensorrt_llm::common::vec2str(convert_shape(logits)).c_str());
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(logits.size(2)) == vocab_size_padded_,
-        tensorrt_llm::common::fmtstr("logits is of shape (batch_size, beam_width, "
-                                     "vocab_size(%ld)), but got the last dim=%ld.",
-            vocab_size_padded_, static_cast<size_t>(logits.size(2))));
+        "logits is of shape (batch_size, beam_width, vocab_size(%ld)), but got the last dim=%ld.", vocab_size_padded_,
+        static_cast<size_t>(logits.size(2)));
 
     CHECK_INPUT(end_id, torch::kInt32);
 
@@ -330,7 +319,8 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
     CHECK_OPTIONAL_INPUT(src_cache_indirection_opt, torch::kInt32);
 
     CHECK_INPUT(output_token_ids, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(finished_opt, torch::kBool);
+    CHECK_OPTIONAL_INPUT(finished_input, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(finished_output, torch::kUInt8);
     CHECK_OPTIONAL_INPUT(seuqence_lengths_opt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);
@@ -341,15 +331,16 @@ th::Tensor DynamicDecodeOp::forward(th::Tensor logits, int64_t step, int64_t max
 
     dynamic_decode_->forward(
         // Inputs
-        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<uint32_t>(ite),
-        static_cast<int>(local_batch_size), end_id, embedding_bias_opt, input_lengths_opt, sequence_limit_length_opt,
-        stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt, src_cache_indirection_opt,
+        logits, static_cast<int>(step), static_cast<int>(max_input_length), static_cast<int>(max_attention_window),
+        static_cast<uint32_t>(ite), static_cast<int>(local_batch_size), end_id, embedding_bias_opt, input_lengths_opt,
+        sequence_limit_length_opt, stop_words_list_opt, bad_words_list_opt, no_repeat_ngram_size_opt,
+        src_cache_indirection_opt,
         // Outputs
-        output_token_ids, newTokens, should_stop, finished_opt, seuqence_lengths_opt, cum_log_probs_opt,
-        output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt, beam_hyps_output_ids_tgt_opt,
-        beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt, beam_hyps_normed_scores_opt,
-        beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt, beam_hyps_is_done_opt,
-        use_beam_hyps);
+        output_token_ids, newTokens, should_stop, finished_input, finished_output, seuqence_lengths_opt,
+        cum_log_probs_opt, output_log_probs_opt, parent_ids_opt, tgt_cache_indirection_opt,
+        beam_hyps_output_ids_tgt_opt, beam_hyps_sequence_lengths_tgt_opt, beam_hyps_cum_log_probs_opt,
+        beam_hyps_normed_scores_opt, beam_hyps_log_probs_opt, beam_hyps_min_normed_scores_opt, beam_hyps_num_beams_opt,
+        beam_hyps_is_done_opt, use_beam_hyps);
 
     return should_stop;
 }
